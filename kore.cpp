@@ -536,8 +536,10 @@ KORE_AVX2 static float dot_q4_K_q8_K_avx2(int64_t n, const uint8_t *w, const Blo
     const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
     __m256 acc = _mm256_setzero_ps();
     __m128 accm = _mm_setzero_ps();
-    for (int64_t i = 0; i < n / 256; i++) {
+    const int64_t nb = n / 256;
+    for (int64_t i = 0; i < nb; i++) {
         const uint8_t *b = w + i * 144;
+        if (i + 2 < nb) _mm_prefetch((const char *)(w + (i + 2) * 144), _MM_HINT_T0);
         const float d = rd_f16(b) * y[i].d;
         const float dmin = rd_f16(b + 2) * y[i].d;
 
@@ -587,8 +589,10 @@ KORE_AVX2 static float dot_q6_K_q8_K_avx2(int64_t n, const uint8_t *w, const Blo
     const __m256i m3 = _mm256_set1_epi8(0x03);
     __m256 acc = _mm256_setzero_ps();
     float summ = 0;
-    for (int64_t i = 0; i < n / 256; i++) {
+    const int64_t nb = n / 256;
+    for (int64_t i = 0; i < nb; i++) {
         const uint8_t *b = w + i * 210;
+        if (i + 2 < nb) _mm_prefetch((const char *)(w + (i + 2) * 210), _MM_HINT_T0);
         const uint8_t *ql = b, *qh = b + 128;
         const int8_t *sc = (const int8_t *)(b + 192);
         const float d = rd_f16(b + 208) * y[i].d;
@@ -642,6 +646,9 @@ static bool matvec_rows(const Tensor &t, const BlockQ8K *xq, float *out, uint64_
     const uint64_t row_bytes = (uint64_t)(n / 256) * (t.type == GGML_Q4_K ? 144 : 210);
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *w = t.data + r * row_bytes;
+#if KORE_HAVE_AVX2
+        if (r + 2 < r1) _mm_prefetch((const char *)(t.data + (r + 2) * row_bytes), _MM_HINT_T0);
+#endif
         if (t.type == GGML_Q4_K) out[r] = avx2 ? dot_q4_K_q8_K_avx2(n, w, xq) : dot_q4_K_q8_K_ref(n, w, xq);
         else                     out[r] = avx2 ? dot_q6_K_q8_K_avx2(n, w, xq) : dot_q6_K_q8_K_ref(n, w, xq);
     }
