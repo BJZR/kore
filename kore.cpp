@@ -1995,7 +1995,7 @@ static std::string json_escape(const std::string &s) {
 "if(l.startsWith('data: ')){const o=JSON.parse(l.slice(6));" \
 "if(o.type==='chunk'){out+=o.text;b.textContent=out;log.scrollTop=log.scrollHeight;}" \
 "else if(o.type==='done'){st.textContent='OK · '+o.tokens+' tokens · '+Math.round(o.ms/1000)+'s';}" \
-"else if(o.type==='error'){st.textContent='error: '+o.text;}}}catch(e){st.textContent='error: '+e;}" \
+"else if(o.type==='error'){st.textContent='error: '+o.text;}}}}}catch(e){st.textContent='error: '+e;}" \
 "inp.disabled=snd.disabled=false;inp.focus();}" \
 "inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});" \
 "snd.onclick=send;rst.onclick=async()=>{await fetch('/api/reset',{method:'POST'});log.innerHTML='';};</script></body></html>"

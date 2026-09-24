@@ -50,7 +50,10 @@ if [ "$1" = "--install" ]; then
     install -d "$2/bin"
     for t in $TOOLS; do install -m 755 "bin/$t" "$2/bin/"; done
     echo "instalado en $2/bin"
+else
+    cp -f bin/kore ./kore
 fi
 
 echo "listo:"
 for t in $TOOLS; do echo "  bin/$t"; done
+echo "  ./kore (renovado, uso rápido)"
