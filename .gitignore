@@ -7,9 +7,11 @@ kore_tok
 kore_client
 kore_orch
 kore_tui
+/bin/
 
 # modelo (grande) y artefactos
 *.gguf
 *.log
 *.sock
 /tmp/
+.ctxt

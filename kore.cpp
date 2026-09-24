@@ -17,6 +17,7 @@
 #include <immintrin.h>
 #include <random>
 #include <thread>
+#include <mutex>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <utility>
 
@@ -1672,6 +1675,7 @@ struct ChatSession {
     std::mt19937 rng;
     float temp = 0.0f;
     std::string system_msg = "You are a helpful assistant.";
+    std::string name;                   // ruta del modelo (para la UI)
     bool generating = false;
 };
 
@@ -1832,18 +1836,284 @@ static double now_ms() {
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
 
+// ---------------------------------------------------------------- PARTE 8
+// WebUI (iteracion 4): mini servidor HTTP sin dependencias. Un solo cliente con
+// generacion activa a la vez (igual que el IPC); la sesion se blinda con un mutex.
+
+static bool tcp_send(int fd, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    while (n > 0) {
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        p += w; n -= (size_t)w;
+    }
+    return true;
+}
+
+// Lee la peticion HTTP (metodo, ruta y body) acumulando en un buffer. Sin timeouts.
+static bool http_read_request(int fd, std::string &method, std::string &path, std::string &body) {
+    std::string buf;
+    char tmp[4096];
+    bool head_done = false;
+    for (;;) {
+        const ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) return false;
+        buf.append(tmp, (size_t)n);
+        if (!head_done && buf.find("\r\n\r\n") != std::string::npos) head_done = true;
+        if (head_done) {
+            const size_t cl = buf.find("Content-Length:", 0) == std::string::npos ? 0 : 1;
+            break;
+        }
+        if (buf.size() > (size_t)1 << 20) return false;
+    }
+    // cabeceras terminadas: separar cuerpo (tras \r\n\r\n)
+    const size_t h = buf.find("\r\n\r\n");
+    if (h == std::string::npos) return false;
+    body = buf.substr(h + 4);
+    size_t clen = 0;
+    {
+        size_t p = buf.find("Content-Length:");
+        if (p != std::string::npos) {
+            p += 16;
+            while (p < h && (buf[p] == ' ' || buf[p] == '\t')) p++;
+            char *end = nullptr;
+            clen = (size_t)strtoul(buf.c_str() + p, &end, 10);
+        }
+    }
+    while (body.size() < clen) {
+        const ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) return false;
+        body.append(tmp, (size_t)n);
+    }
+    const size_t sp1 = buf.find(' '), sp2 = sp1 == std::string::npos ? std::string::npos : buf.find(' ', sp1 + 1);
+    if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
+    method = buf.substr(0, sp1);
+    path = buf.substr(sp1 + 1, sp2 - sp1 - 1);
+    return true;
+}
+
+static void http_status(int fd, const char *code, const char *ct, const std::string &body) {
+    std::string r = std::string("HTTP/1.1 ") + code + "\r\n";
+    if (ct) r += std::string("Content-Type: ") + ct + "\r\n";
+    r += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    r += "Connection: close\r\nCache-Control: no-store\r\n\r\n" + body;
+    tcp_send(fd, r.data(), r.size());
+}
+
+static void http_stream_head(int fd, const char *code, const char *ct) {
+    std::string r = std::string("HTTP/1.1 ") + code + "\r\nContent-Type: " + ct +
+        "\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    tcp_send(fd, r.data(), r.size());
+}
+
+// JSON minimo: valor string o numero de una clave plana ({"k":"v",...}).
+static std::string json_get_string(const std::string &s, const char *key) {
+    const std::string k = std::string("\"") + key + "\"";
+    size_t p = s.find(k);
+    if (p == std::string::npos) return "";
+    p = s.find(':', p + k.size());
+    if (p == std::string::npos) return "";
+    p = s.find('"', p + 1);
+    if (p == std::string::npos) return "";
+    ++p;
+    std::string out;
+    while (p < s.size() && s[p] != '"') {
+        if (s[p] == '\\' && p + 1 < s.size()) {
+            const char c = s[p + 1];
+            if (c == 'n') out += '\n';
+            else if (c == 'r') out += '\r';
+            else if (c == 't') out += '\t';
+            else out += c;
+            p += 2;
+        } else out += s[p++];
+    }
+    return out;
+}
+
+static double json_get_number(const std::string &s, const char *key, double dflt) {
+    const std::string k = std::string("\"") + key + "\"";
+    size_t p = s.find(k);
+    if (p == std::string::npos) return dflt;
+    p = s.find(':', p + k.size());
+    if (p == std::string::npos) return dflt;
+    char *end = nullptr;
+    return strtod(s.c_str() + p + 1, &end);
+}
+
+static std::string json_escape(const std::string &s) {
+    std::string o;
+    o.reserve(s.size() + 16);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\r': o += "\\r"; break;
+            case '\t': o += "\\t"; break;
+            default:
+                if (c < 0x20) { o += "\\u00"; o += "0123456789abcdef"[(c >> 4) & 15]; o += "0123456789abcdef"[c & 15]; }
+                else o += (char)c;
+        }
+    }
+    return o;
+}
+
+#define KORE_WEB_PAGE \
+"<!doctype html><html lang=es><head><meta charset=utf-8>" \
+"<meta name=viewport content='width=device-width,initial-scale=1'>" \
+"<title>KORE</title><style>*{box-sizing:border-box;font-family:system-ui,Segoe UI,sans-serif}" \
+"body{margin:0;background:#0f1117;color:#e7e9ef;display:flex;flex-direction:column;height:100vh}" \
+"header{padding:10px 16px;background:#171923;border-bottom:1px solid #262a38;font-size:13px;color:#9aa3ba}" \
+"main{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}" \
+".msg{max-width:780px;white-space:pre-wrap;line-height:1.55;font-size:15px;border-radius:10px;padding:10px 14px}" \
+".user{align-self:flex-end;background:#2b3a66;color:#eef} .bot{align-self:flex-start;background:#1d2130;color:#e7e9ef}" \
+"footer{padding:10px;background:#171923;border-top:1px solid #262a38;display:flex;gap:8px}" \
+"textarea{flex:1;resize:none;background:#0d0f16;color:#e7e9ef;border:1px solid #2a2f40;border-radius:8px;padding:8px;font-size:14px}" \
+"button{background:#3b4a8f;border:0;color:#fff;border-radius:8px;padding:8px 14px;cursor:pointer}" \
+"button:disabled{opacity:.45}button.sec{background:#262a38}" \
+".meta{max-width:780px;color:#6f7890;font-size:12px}.spin{display:inline-block;width:12px;height:12px;border:2px solid #3b4a8f;border-top-color:#8fa6ff;border-radius:50%;animation:g 0.8s linear infinite;vertical-align:-2px;margin-right:6px}@keyframes g{to{transform:rotate(360deg)}}</style></head>" \
+"<body><header><b>KORE</b> &mdash; <span id=meta>...</span></header>" \
+"<main id=log></main>" \
+"<footer><textarea id=in rows=1 placeholder='Escribe tu mensaje (Enter para enviar, Shift+Enter salto de linea)'></textarea>" \
+"<button id=snd>Enviar</button><button class=sec id=rst>Nueva</button></footer>" \
+"<script>" \
+"const meta=document.getElementById('meta'),log=document.getElementById('log')," \
+"inp=document.getElementById('in'),snd=document.getElementById('snd'),rst=document.getElementById('rst');" \
+"fetch('/api/state').then(r=>r.json()).then(s=>meta.textContent='funcionando: '+s.name+' ctx='+s.ctx+' hilos='+s.threads+(s.avx2?' AVX2':' escalar')+' temp='+s.temp);" \
+"function add(msg,cls){const d=document.createElement('div');d.className='msg '+cls;d.textContent=msg;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}" \
+"async function send(){const t=inp.value.trim();if(!t)return;inp.value='';inp.disabled=snd.disabled=true;" \
+"const u=add('<i>enviando…</i>','user');u.textContent=t;const b=add('','bot');" \
+"const st=document.createElement('span');st.className='meta';st.textContent='generando…';log.appendChild(st);" \
+"let out='';try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t,temp:0.7,n:256})});" \
+"if(!r.ok){st.textContent='error '+r.status+' '+await r.text();b.textContent='(Error de conexion)';return;}" \
+"const rd=r.body.getReader(),dc=new TextDecoder();let buf='';" \
+"for(;;){const{done,value}=await rd.read();if(done)break;buf+=dc.decode(value,{stream:true});" \
+"let i;while((i=buf.indexOf('\\n'))>=0){const l=buf.slice(0,i);buf=buf.slice(i+1);" \
+"if(l.startsWith('data: ')){const o=JSON.parse(l.slice(6));" \
+"if(o.type==='chunk'){out+=o.text;b.textContent=out;log.scrollTop=log.scrollHeight;}" \
+"else if(o.type==='done'){st.textContent='OK · '+o.tokens+' tokens · '+Math.round(o.ms/1000)+'s';}" \
+"else if(o.type==='error'){st.textContent='error: '+o.text;}}}catch(e){st.textContent='error: '+e;}" \
+"inp.disabled=snd.disabled=false;inp.focus();}" \
+"inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});" \
+"snd.onclick=send;rst.onclick=async()=>{await fetch('/api/reset',{method:'POST'});log.innerHTML='';};</script></body></html>"
+
+// Envia un evento SSE "data: {...}\n\n".
+static void sse_event(int fd, const std::string &type, const std::string &text) {
+    std::string e = std::string("data: {\"type\":\"") + type + "\",\"text\":\"" + text + "\"}\n\n";
+    tcp_send(fd, e.data(), e.size());
+}
+
+static void web_server(const char *addr_port, ChatSession &s) {
+    std::string ap = addr_port;
+    const size_t sep = ap.rfind(':');
+    if (sep == std::string::npos) { fprintf(stderr, "error: --web espera <ip:puerto> (p. ej. 127.0.0.1:8080)\n"); return; }
+    const std::string host = ap.substr(0, sep);
+    const int port = atoi(ap.c_str() + sep + 1);
+    if (port <= 0 || port > 65535) { fprintf(stderr, "error: puerto invalido\n"); return; }
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { perror("socket"); return; }
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    if (host.empty() || host == "0.0.0.0") a.sin_addr.s_addr = INADDR_ANY;
+    else if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { fprintf(stderr, "error: IP invalida '%s'\n", host.c_str()); close(lfd); return; }
+    if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("bind"); close(lfd); return; }
+    if (listen(lfd, 8) < 0) { perror("listen"); close(lfd); return; }
+    fprintf(stderr, "KORE-Web: http://%s:%d  (modelo %s)\n", host.c_str(), port, s.name.c_str());
+
+    std::mutex mu;
+    for (;;) {
+        int cfd = accept(lfd, nullptr, nullptr);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept"); break;
+        }
+        std::thread([&, cfd] {
+            std::string method, path, body;
+            if (!http_read_request(cfd, method, path, body)) { close(cfd); return; }
+            if (method == "GET" && path == "/") {
+                http_status(cfd, "200 OK", "text/html; charset=utf-8", KORE_WEB_PAGE);
+            } else if (method == "GET" && path == "/api/state") {
+                char js[512];
+                snprintf(js, sizeof(js),
+                        "{\"name\":\"%s\",\"ctx\":%d,\"threads\":%u,\"avx2\":%s,\"temp\":%.2f}",
+                        json_escape(s.name).c_str(), s.e.ctx, s.e.nth,
+                        s.e.avx2 ? "true" : "false", (double)s.temp);
+                http_status(cfd, "200 OK", "application/json", js);
+            } else if (method == "POST" && path == "/api/reset") {
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    s.conv.clear();
+                    s.generating = false;
+                }
+                http_status(cfd, "200 OK", "application/json", "{\"ok\":true}");
+            } else if (method == "POST" && path == "/api/chat") {
+                const std::string prompt = json_get_string(body, "prompt");
+                double temp = json_get_number(body, "temp", s.temp);
+                const double nmax = json_get_number(body, "n", 256);
+                if (prompt.empty() || nmax <= 0) {
+                    http_status(cfd, "400 Bad Request", "application/json", "{\"error\":\"prompt vacio\"}");
+                } else {
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (s.generating) {
+                        http_status(cfd, "409 Conflict", "application/json", "{\"error\":\"otra generacion en curso\"}");
+                    } else {
+                        s.temp = (float)temp;
+                        std::vector<int32_t> ids;
+                        chat_ids(s.v, s.system_msg, prompt, ids);
+                        std::string err;
+                        if (!prefill(s, ids, &err)) {
+                            http_status(cfd, "400 Bad Request", "application/json",
+                                        (std::string)"{\"error\":\"" + json_escape(err) + "\"}");
+                        } else {
+                            http_stream_head(cfd, "200 OK", "text/event-stream");
+                            const double t0 = now_ms();
+                            int n = 0;
+                            for (int i = 0; i < (int)nmax; i++) {
+                                int tok = 0; std::string piece; bool full = false;
+                                const int r = gen_step(s, &tok, &piece, &full);
+                                if (r == 1) { sse_event(cfd, "chunk", json_escape(piece)); n++; }
+                                else if (r == 0) break;
+                                else { sse_event(cfd, "error", "fallo en el forward"); break; }
+                            }
+                            const double ms = now_ms() - t0;
+                            std::string done = "{\"type\":\"done\",\"tokens\":" + std::to_string(n) +
+                                               ",\"ms\":" + std::to_string((uint64_t)ms) + "}\n\n";
+                            tcp_send(cfd, done.data(), done.size());
+                            close(cfd);
+                            return;
+                        }
+                    }
+                }
+            } else {
+                http_status(cfd, "404 Not Found", "text/plain", "no");
+            }
+            close(cfd);
+        }).detach();
+    }
+    close(lfd);
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "uso: %s modelo.gguf \"pregunta\" [opciones]\n"
         "     %s modelo.gguf --ids 1,2,3 [--dump logits.f32]\n"
         "     %s modelo.gguf --serve /tmp/kore.sock [opciones]   (servidor IPC, iteracion 2)\n"
+        "     %s modelo.gguf --web 127.0.0.1:8080 [opciones]     (WebUI, iteracion 4)\n"
         "opciones: -n N  --ctx N  --threads N  --temp T  --seed N  --system \"...\"\n"
-        "          --raw  --float  --serve SOCKET\n", prog, prog, prog);
+        "          --raw  --float  --serve SOCKET  --web IP:PUERTO\n", prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
     const char *path = nullptr;
-    std::string prompt, system_msg = "You are a helpful assistant.", ids_arg, dump_path, serve_path;
+    std::string prompt, system_msg = "You are a helpful assistant.", ids_arg, dump_path, serve_path, web_addr;
     bool have_prompt = false, raw = false, use_float = false;
     int n_predict = 256, ctx = 2048;
     unsigned nth = std::max(1u, std::thread::hardware_concurrency());
@@ -1862,6 +2132,7 @@ int main(int argc, char **argv) {
         else if (a == "--ids" && has_val)      ids_arg = argv[++i];
         else if (a == "--dump" && has_val)     dump_path = argv[++i];
         else if (a == "--serve" && has_val)    serve_path = argv[++i];
+        else if (a == "--web" && has_val)      web_addr = argv[++i];
         else if (a == "--raw")                 raw = true;
         else if (a == "--float")               use_float = true;
         else if (!path && a[0] != '-')         path = argv[i];
@@ -1869,7 +2140,7 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "argumento no reconocido: %s\n", a.c_str()); usage(argv[0]); return 1; }
     }
     if (!path || ctx < 8 || n_predict < 0 ||
-        (serve_path.empty() && !have_prompt && ids_arg.empty())) { usage(argv[0]); return 1; }
+        (serve_path.empty() && web_addr.empty() && !have_prompt && ids_arg.empty())) { usage(argv[0]); return 1; }
 
     Model m;
     if (!load_model(path, m)) return 1;
@@ -1894,6 +2165,19 @@ int main(int argc, char **argv) {
         s.rng = std::mt19937(seed);
         s.system_msg = system_msg;
         serve(serve_path.c_str(), s);
+        return 0;
+    }
+
+    // ---- modo WebUI (iteracion 4)
+    if (!web_addr.empty()) {
+        ChatSession s;
+        s.e = std::move(e);
+        s.v = std::move(v);
+        s.temp = temp;
+        s.rng = std::mt19937(seed);
+        s.system_msg = system_msg;
+        s.name = path;
+        web_server(web_addr.c_str(), s);
         return 0;
     }
 
