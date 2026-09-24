@@ -2083,6 +2083,7 @@ static void web_server(const char *addr_port, ChatSession &s) {
                                 else if (r == 0) break;
                                 else { sse_event(cfd, "error", "fallo en el forward"); break; }
                             }
+                            s.generating = false;   // fin de turno: EOS, contexto lleno o tope de n
                             const double ms = now_ms() - t0;
                             std::string done = "{\"type\":\"done\",\"tokens\":" + std::to_string(n) +
                                                ",\"ms\":" + std::to_string((uint64_t)ms) + "}\n\n";
