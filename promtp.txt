@@ -1,0 +1,111 @@
+¡Entendido! Lo que buscas es un proyecto de ingeniería de software extremadamente ambicioso pero técnicamente fascinante. Vamos a diseñar el prompt para un sistema que es, esencialmente, **una pila completa de IA de alto rendimiento escrita exclusivamente en C++ desde la base**.
+
+---
+
+### Concepto del Proyecto
+
+### Modelo de IA
+Qwen2.5-7B-Instruct-abliterated-v2-Q4_K_M.gguf
+
+Construir un motor de inferencia de modelos de lenguaje (LLM) totalmente propietario en C++ (optimizando kernels matemáticos y gestión de memoria a bajo nivel) y rodearlo de una arquitectura de microservicios, también en C++, que exponga tanto una interfaz de terminal (TUI) como una interfaz web (WebUI), ambas minimalistas, elegantes y eficientes.
+
+### El Nombre
+
+He seleccionado **KORE** (un guiño a "Core" en inglés, núcleo/esencia, y una referencia a la figura mitológica vinculada al inframundo y la renovación, sugiriendo poder oculto). Es simple, corto, poderoso y fácil de recordar.
+
+---
+
+### El Prompt Maestro para el Desarrollo de KORE
+
+Este prompt está diseñado para guiarte (o a un equipo de desarrollo) en la estructuración de todo el ecosistema de **KORE**.
+
+> **Título del Proyecto:** KORE — Motor de Inferencia y Plataforma de Agentes de Alto Rendimiento, "Full-Stack C++".
+> **Filosofía de Diseño:** Rendimiento extremo, control absoluto de memoria, modularidad interproceso (IPC), interfaces minimalistas y elegantes. Cero dependencias externas de alto nivel (como frameworks web pesados o librerías de IA de terceros); todo debe implementarse desde la base o usando librerías de C++ de "header-only" de bajo nivel.
+> **Misión:** Crear un motor que cargue y ejecute inferencia en un modelo LLM específico (ej. Llama-3-8B-Instruct o un modelo custom) y exponga esa capacidad a través de dos interfaces independientes pero sincronizadas (TUI y Web), optimizando cada ciclo de CPU/GPU.
+> **Arquitectura del Sistema (Modular e Interproceso)**
+> El sistema se dividirá en cuatro binarios independientes que se comunican mediante Unix Domain Sockets (IPC local) o memoria compartida (`shm_open`) para una latencia mínima.
+> ---
+> 
+> 
+> #### 1. KORE-Core (El Motor de Inferencia)
+> 
+> 
+> * **Lenguaje:** C++20 / C++23.
+> * **Objetivo:** Inferencia de alta velocidad.
+> * **Funcionalidades Clave:**
+> * **Lector de Modelo:** Implementación manual de parsing de formatos de modelos (ej. GGUF simplificado o un formato binario custom `kore.weights`).
+> * **Tokenizer:** Implementación de BPE o WordPiece en C++ puro.
+> * **Kernels Matemáticos:** Multiplicaciones de matrices ($C=A \cdot B$), Softmax, RoPE (Positional Embeddings) escritos a mano.
+> * **Optimización SIMD:** Uso manual de instrucciones AVX2/AVX-512 (para CPU x86) o NEON (para ARM/Apple Silicon). *Opcional: Kernels CUDA o Metal básicos para aceleración de GPU.*
+> * **Cuantización:** Implementación de soporte para pesos en 4-bit, 8-bit e int16.
+> * **KV-Cache:** Gestión de memoria eficiente para el contexto de la conversación.
+> * **Servidor IPC:** Escucha peticiones de generación de tokens (`PROMPT:`, `TOKEN:`, `RESET:`) y responde por streaming a través de un Unix Domain Socket.
+> 
+> 
+> 
+> 
+> #### 2. KORE-Orchestrator (El Agente y Controlador de Estado)
+> 
+> 
+> * **Lenguaje:** C++20.
+> * **Objetivo:** Gestionar el flujo de la conversación, la memoria del agente y la ejecución de herramientas.
+> * **Funcionalidades Clave:**
+> * **Gestión de Contexto:** Almacenamiento eficiente del historial de chats en memoria/bases de datos vectoriales ligeras (ej. SQLite o una implementación personalizada en C++).
+> * **Cliente IPC:** Se conecta al `KORE-Core` para enviar prompts y recibir tokens en streaming.
+> * **Bucle de Control ReAct:** Pausa la generación de tokens si detecta una solicitud de "acción" del modelo (ej. `[ACTION: execute_script]`), ejecuta la herramienta y reinyecta el resultado como contexto.
+> * **Ejecutor de Herramientas:** Uso de `fork` y `execve` para lanzar scripts del sistema y capturar sus resultados.
+> * **Servidor de Estado:** Expone un estado unificado (historial de chat, estado del agente) a las interfaces TUI y Web.
+> 
+> 
+> 
+> 
+> #### 3. KORE-TUI (La Interfaz de Terminal)
+> 
+> 
+> * **Lenguaje:** C++20.
+> * **Estilo:** Minimalista, elegante, tipo terminal oscura, enfocado en el texto.
+> * **Funcionalidades Clave:**
+> * **Uso de Librerías:** Implementado usando librerías TUI de bajo nivel como `ftxui` o `ncurses`.
+> * **Visualización en Tiempo Real:** Muestra el streaming de tokens de `KORE-Core` a medida que llegan.
+> * **Manejo de Input:** Input de texto elegante para el usuario, soporte para comandos de terminal básicos.
+> * **Diseño:** Separación clara entre el historial de chat (scrollable) y la zona de input, con bordes finos y uso sutil del color.
+> 
+> 
+> 
+> 
+> #### 4. KORE-WebUI (La Interfaz Web Minimalista)
+> 
+> 
+> * **Lenguaje:** C++20 (Servidor Backend), HTML/CSS/JavaScript Minimalista (Frontend).
+> * **Estilo:** Limpio, moderno, tipografía "sans-serif" elegante, paleta de colores monocromática, animaciones muy sutiles.
+> * **Funcionalidades Clave:**
+> * **Servidor Web C++:** Implementado usando una librería web C++ ligera como `uWebSockets` o `Drogon`.
+> * **Conectividad:** Se comunica con el `KORE-Orchestrator` para sincronizar el historial de chat y el estado del agente.
+> * **Frontend Monolítico:** Todo el HTML/CSS/JS compilado e incrustado directamente en el binario del servidor C++ para un despliegue único.
+> * **Streaming de WebSockets:** Actualización en tiempo real del chat en el navegador.
+> 
+> 
+> 
+> 
+> ---
+> 
+> 
+> **Stack de Librerías y Tecnologías Recomendadas (Nivel Bajo):**
+> * **C++ Estándar:** C++20 o superior.
+> * **SIMD:** Uso directo de intrínsecos de CPU (`immintrin.h`, `arm_neon.h`).
+> * **TUI:** `ftxui` (C++ moderno, "header-only", muy personalizable y elegante) o `ncurses`.
+> * **Servidor Web (Backend C++):** `uWebSockets` (rendimiento extremo), `Drogon` (framework completo pero eficiente) o `Crow`.
+> * **Serialización (Opcional):** `nlohmann/json` (para JSON) o una implementación binaria custom.
+> * **Base de Datos (Opcional):** SQLite (C-library) con un wrapper C++ minimalista.
+> 
+> 
+
+---
+
+### Cómo proceder tras este prompt:
+
+1. **Iteración 1: KORE-Core.** Concéntrate obsesivamente en el Paso 1. Logra que un binario en C++ cargue un modelo y genere tokens desde la línea de comandos sin más.
+2. **Iteración 2: El Socket IPC.** Implementa un Unix Domain Socket básico para que otro script de Python o C++ pueda enviar un prompt y leer los tokens resultantes.
+3. **Iteración 3: KORE-Orchestrator y KORE-TUI.** Desarrolla el segundo binario C++ (Orchestrator) y el tercero (TUI). Conéctalos. Ahora tienes un chat en terminal en tiempo real.
+4. **Iteración 4: KORE-WebUI.** Desarrolla el cuarto binario C++ (Servidor Web) y el frontend HTML/CSS minimalista. Conéctalo al Orchestrator. Sincroniza el chat.
+5. **Iteración 5: Optimización.** Vuelve a `KORE-Core` y reescribe los kernels matemáticos con instrucciones SIMD más agresivas.

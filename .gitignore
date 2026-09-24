@@ -1,0 +1,15 @@
+# binarios
+kore
+kore_gguf
+kore_kernels
+kore_quant
+kore_tok
+kore_client
+kore_orch
+kore_tui
+
+# modelo (grande) y artefactos
+*.gguf
+*.log
+*.sock
+/tmp/
