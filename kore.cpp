@@ -1863,10 +1863,7 @@ static bool http_read_request(int fd, std::string &method, std::string &path, st
         if (n <= 0) return false;
         buf.append(tmp, (size_t)n);
         if (!head_done && buf.find("\r\n\r\n") != std::string::npos) head_done = true;
-        if (head_done) {
-            const size_t cl = buf.find("Content-Length:", 0) == std::string::npos ? 0 : 1;
-            break;
-        }
+        if (head_done) break;
         if (buf.size() > (size_t)1 << 20) return false;
     }
     // cabeceras terminadas: separar cuerpo (tras \r\n\r\n)
@@ -1961,6 +1958,86 @@ static std::string json_escape(const std::string &s) {
     return o;
 }
 
+// Devuelve cada elemento de un array JSON (los bloques entre llaves) como texto plano.
+static std::vector<std::string> json_array_blocks(const std::string &s, const char *key) {
+    const std::string k = std::string("\"") + key + "\"";
+    std::vector<std::string> out;
+    size_t p = s.find(k);
+    if (p == std::string::npos) return out;
+    p = s.find('[', p + k.size());
+    if (p == std::string::npos) return out;
+    std::string cur;
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = p + 1; i < s.size(); i++) {
+        const char c = s[i];
+        if (in_str) {
+            cur += c;
+            if (c == '\\' && i + 1 < s.size()) cur += s[++i];
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; cur += c; continue; }
+        if (c == '[' || c == '{') depth++;
+        else if (c == ']' || c == '}') {
+            depth--;
+            if (depth == 0) { out.push_back(cur); cur.clear(); continue; }
+        }
+        if (depth >= 0) cur += c;
+    }
+    return out;
+}
+
+// OpenAI: construye los ids de un chat multi-turno desde un array de mensajes
+// [{role,content}]. Devuelve false si el mensaje de cierre no es de usuario.
+static bool chat_ids_messages(const Vocab &v, const std::string &system_text,
+                              const std::vector<std::string> &msgs, std::vector<int32_t> &ids) {
+    auto special = [&](const char *s) -> int32_t {
+        auto it = v.tok2id.find(s);
+        return it == v.tok2id.end() ? -1 : it->second;
+    };
+    const int32_t im_start = special("<|im_start|>"), im_end = special("<|im_end|>");
+    auto text = [&](const std::string &s) {
+        std::vector<int32_t> t = encode(v, s, false);
+        ids.insert(ids.end(), t.begin(), t.end());
+    };
+    if (im_start < 0 || im_end < 0) return false;      // requiere tokenizador ChatML
+    if (!system_text.empty()) { ids.push_back(im_start); text("system\n" + system_text); ids.push_back(im_end); text("\n"); }
+    std::string role, content;
+    bool last_user = false;
+    for (const std::string &b : msgs) {
+        role = json_get_string(b, "role");
+        content = json_get_string(b, "content");
+        if (role.empty()) continue;
+        if (role == "user") { ids.push_back(im_start); text("user\n" + content); ids.push_back(im_end); text("\n"); last_user = true; }
+        else if (role == "assistant") { ids.push_back(im_start); text("assistant\n" + content); ids.push_back(im_end); text("\n"); last_user = false; }
+        else if (role == "system" && system_text.empty()) { ids.push_back(im_start); text("system\n" + content); ids.push_back(im_end); text("\n"); }
+    }
+    if (!last_user) return false;
+    ids.push_back(im_start); text("assistant\n");
+    return true;
+}
+
+// Embedding de `input`: prefill completo sin logits (residuo final del último
+// token), RMSNorm + normalización L2. Devuelve false ante un token inválido.
+static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std::vector<float> &out) {
+    const std::vector<int32_t> ids = encode(v, input, false);
+    if (ids.empty() || (int)ids.size() > e.ctx) return false;
+    for (size_t i = 0; i < ids.size(); i += (size_t)e.bsz) {
+        const int nb = (int)std::min<size_t>((size_t)e.bsz, ids.size() - i);
+        if (!forward_batch(e, (const int *)(ids.data() + i), nb, (int)i, false)) return false;
+    }
+    const int E = e.hp.n_embd;
+    std::vector<float> tmp((size_t)E);
+    rmsnorm(tmp.data(), e.bx.data() + (size_t)(ids.size() - 1) * E, e.out_norm, E, e.hp.rms_eps);
+    double n2 = 0;
+    for (int i = 0; i < E; i++) n2 += (double)tmp[(size_t)i] * tmp[(size_t)i];
+    n2 = std::sqrt(n2);
+    out.assign(tmp.begin(), tmp.end());
+    if (n2 > 0) { const float inv = (float)(1.0 / n2); for (float &x : out) x *= inv; }
+    return true;
+}
+
 #define KORE_WEB_PAGE \
 "<!doctype html><html lang=es><head><meta charset=utf-8>" \
 "<meta name=viewport content='width=device-width,initial-scale=1'>" \
@@ -2012,7 +2089,84 @@ static void sse_event(int fd, const std::string &type, const std::string &text) 
     tcp_send(fd, e.data(), e.size());
 }
 
-static void web_server(const char *addr_port, ChatSession &s) {
+// POST /v1/embeddings (API OpenAI): devuelve el embedding L2 del último token.
+static void web_embed(int cfd, const std::string &body, ChatSession &s, Engine &e_emb, std::mutex &mu) {
+    const std::string input = json_get_string(body, "input");
+    if (input.empty()) { http_status(cfd, "400 Bad Request", "application/json", "{\"error\":\"input vacio\"}"); return; }
+    std::lock_guard<std::mutex> lk(mu);
+    if (e_emb.hp.n_embd == 0) { http_status(cfd, "500 Internal Server Error", "application/json", "{\"error\":\"embeddings no disponibles\"}"); return; }
+    std::vector<float> vec;
+    if (!embed_text(e_emb, s.v, input, vec)) { http_status(cfd, "400 Bad Request", "application/json", "{\"error\":\"input invalido o demasiado largo\"}"); return; }
+    std::string j = "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[";
+    for (size_t i = 0; i < vec.size(); i++) { j += std::to_string(vec[i]); if (i + 1 < vec.size()) j += ","; }
+    j += "]}]}";
+    http_status(cfd, "200 OK", "application/json", j);
+}
+
+// POST /v1/chat/completions (API OpenAI): sesion ESTATICA (cada request se
+// procesa sobre la historia completa que envia el cliente) con stream SSE.
+static void web_chat_completions(int cfd, const std::string &body, ChatSession &s, std::mutex &mu) {
+    double temp = json_get_number(body, "temperature", s.temp);
+    const double nmax = json_get_number(body, "max_tokens", 256);
+    const bool stream =
+        body.find("\"stream\":true") != std::string::npos || body.find("\"stream\": true") != std::string::npos;
+    const std::vector<std::string> msgs = json_array_blocks(body, "messages");
+    std::string system_text;
+    for (const std::string &b : msgs)
+        if (json_get_string(b, "role") == "system") { system_text = json_get_string(b, "content"); break; }
+    if (system_text.empty()) system_text = s.system_msg;
+
+    std::lock_guard<std::mutex> lk(mu);
+    if (s.generating) { http_status(cfd, "429 Too Many Requests", "application/json", "{\"error\":\"generacion en curso\"}"); return; }
+    s.temp = (float)temp;
+    s.conv.clear();                          // OpenAI: contexto fresco por request
+    std::vector<int32_t> ids;
+    if (!chat_ids_messages(s.v, system_text, msgs, ids)) {
+        http_status(cfd, "400 Bad Request", "application/json", "{\"error\":\"mensajes invalidos o sin turno de usuario final\"}");
+        return;
+    }
+    std::string err;
+    if (!prefill(s, ids, &err)) { http_status(cfd, "400 Bad Request", "application/json", (std::string)"{\"error\":\"" + json_escape(err) + "\"}"); return; }
+
+    const std::string cid = "chatcmpl-kore-" + std::to_string((uint64_t)(now_ms() / 1000.0));
+    const std::string mn = json_escape(s.name);
+    auto ev = [&](const std::string &json) { std::string d = "data: " + json + "\n\n"; tcp_send(cfd, d.data(), d.size()); };
+
+    int n = 0;
+    std::string acc;
+    if (stream) http_stream_head(cfd, "200 OK", "text/event-stream");
+    for (int i = 0; i < (int)nmax; i++) {
+        int tok = 0; std::string piece; bool full = false;
+        const int r = gen_step(s, &tok, &piece, &full);
+        if (r == 1) {
+            n++;
+            if (stream) {
+                ev(std::string("{\"id\":\"") + cid + "\",\"object\":\"chat.completion.chunk\",\"model\":\"" + mn +
+                   "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + json_escape(piece) +
+                   "\"},\"finish_reason\":null}]}");
+            } else acc += piece;
+        } else if (r == 0) break;
+        else { if (stream) ev("{\"error\":\"fallo en el forward\"}"); s.generating = false; return; }
+    }
+    s.generating = false;
+    const int pt = (int)ids.size();
+    if (stream) {
+        ev(std::string("{\"id\":\"") + cid + "\",\"object\":\"chat.completion.chunk\",\"model\":\"" + mn +
+           "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
+        ev("{\"id\":\"" + cid + "\",\"object\":\"chat.completion.chunk\",\"model\":\"" + mn + "\",\"choices\":[],\"usage\":{\"prompt_tokens\":" +
+           std::to_string(pt) + ",\"completion_tokens\":" + std::to_string(n) + ",\"total_tokens\":" + std::to_string(pt + n) + "}}");
+        tcp_send(cfd, "data: [DONE]\n\n", 15);
+    } else {
+        http_status(cfd, "200 OK", "application/json",
+            std::string("{\"id\":\"") + cid + "\",\"object\":\"chat.completion\",\"created\":" +
+            std::to_string((uint64_t)(now_ms() / 1000.0)) + ",\"model\":\"" + mn +
+            "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(acc) +
+            "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(pt) +
+            ",\"completion_tokens\":" + std::to_string(n) + ",\"total_tokens\":" + std::to_string(pt + n) + "}}");
+    }
+}
+
+static void web_server(const char *addr_port, ChatSession &s, const Model &model) {
     std::string ap = addr_port;
     const size_t sep = ap.rfind(':');
     if (sep == std::string::npos) { fprintf(stderr, "error: --web espera <ip:puerto> (p. ej. 127.0.0.1:8080)\n"); return; }
@@ -2032,9 +2186,16 @@ static void web_server(const char *addr_port, ChatSession &s) {
     else if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { fprintf(stderr, "error: IP invalida '%s'\n", host.c_str()); close(lfd); return; }
     if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("bind"); close(lfd); return; }
     if (listen(lfd, 8) < 0) { perror("listen"); close(lfd); return; }
-    fprintf(stderr, "KORE-Web: http://%s:%d  (modelo %s)\n", host.c_str(), port, s.name.c_str());
+    fprintf(stderr, "KORE-Web: http://%s:%d  (modelo %s, OpenAI /v1/* activo)\n", host.c_str(), port, s.name.c_str());
 
     std::mutex mu;
+    Engine e_emb;                            // engine de embeddings (KV propia, contexto corto)
+    {
+        const int emb_ctx = std::min(s.e.ctx, 512);
+        if (!engine_init(e_emb, model, emb_ctx, std::max(1u, s.e.nth), s.e.use_float)) {
+            fprintf(stderr, "error: no se pudo preparar el engine de embeddings\n");
+        }
+    }
     for (;;) {
         int cfd = accept(lfd, nullptr, nullptr);
         if (cfd < 0) {
@@ -2060,6 +2221,14 @@ static void web_server(const char *addr_port, ChatSession &s) {
                     s.generating = false;
                 }
                 http_status(cfd, "200 OK", "application/json", "{\"ok\":true}");
+            } else if (method == "GET" && path == "/v1/models") {
+                http_status(cfd, "200 OK", "application/json",
+                    "{\"object\":\"list\",\"data\":[{\"id\":\"" + json_escape(s.name) +
+                    "\",\"object\":\"model\",\"owned_by\":\"kore\"}]}");
+            } else if (method == "POST" && path == "/v1/embeddings") {
+                web_embed(cfd, body, s, e_emb, mu);
+            } else if (method == "POST" && path == "/v1/chat/completions") {
+                web_chat_completions(cfd, body, s, mu);
             } else if (method == "POST" && path == "/api/chat") {
                 const std::string prompt = json_get_string(body, "prompt");
                 double temp = json_get_number(body, "temp", s.temp);
@@ -2184,7 +2353,7 @@ int main(int argc, char **argv) {
         s.rng = std::mt19937(seed);
         s.system_msg = system_msg;
         s.name = path;
-        web_server(web_addr.c_str(), s);
+        web_server(web_addr.c_str(), s, m);
         return 0;
     }
 
