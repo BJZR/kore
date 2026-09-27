@@ -29,10 +29,13 @@
 #include <vector>
 #include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -2047,6 +2050,7 @@ static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std:
 "main{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}" \
 ".msg{max-width:780px;white-space:pre-wrap;line-height:1.55;font-size:15px;border-radius:10px;padding:10px 14px}" \
 ".user{align-self:flex-end;background:#2b3a66;color:#eef} .bot{align-self:flex-start;background:#1d2130;color:#e7e9ef}" \
+".tool{align-self:flex-start;background:#12182b;color:#8fa6ff;border:1px dashed #2a3a6b;font:12px/1.5 ui-monospace,monospace;max-width:780px;white-space:pre-wrap}" \
 "footer{padding:10px;background:#171923;border-top:1px solid #262a38;display:flex;align-items:center;gap:8px;flex-wrap:wrap}" \
 "textarea{flex:1;min-width:240px;resize:none;background:#0d0f16;color:#e7e9ef;border:1px solid #2a2f40;border-radius:8px;padding:8px;font-size:14px}" \
 "button{background:#3b4a8f;border:0;color:#fff;border-radius:8px;padding:8px 14px;cursor:pointer}" \
@@ -2059,24 +2063,26 @@ static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std:
 "<main id=log></main>" \
 "<footer><textarea id=in rows=1 placeholder='Escribe tu mensaje (Enter para enviar, Shift+Enter salto de linea)'></textarea>" \
 "<span class=tp><label for=tt>temp</label><input id=tt type=range min=0 max=1.5 step=0.05 value=0.3><b id=tv>0.30</b></span>" \
+"<span class=tp><label for=ag>agente</label><input id=ag type=checkbox></span>" \
 "<button id=snd>Enviar</button><button class=sec id=rst>Nueva</button></footer>" \
 "<script>" \
 "const meta=document.getElementById('meta'),log=document.getElementById('log')," \
 "inp=document.getElementById('in'),snd=document.getElementById('snd'),rst=document.getElementById('rst')," \
-"tt=document.getElementById('tt'),tv=document.getElementById('tv');" \
+"tt=document.getElementById('tt'),tv=document.getElementById('tv'),ag=document.getElementById('ag');" \
 "tt.oninput=()=>tv.textContent=parseFloat(tt.value).toFixed(2);" \
 "fetch('/api/state').then(r=>r.json()).then(s=>meta.textContent='funcionando: '+s.name+' ctx='+s.ctx+' hilos='+s.threads+(s.avx2?' AVX2':' escalar')+' temp='+s.temp);" \
 "function add(msg,cls){const d=document.createElement('div');d.className='msg '+cls;d.textContent=msg;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}" \
 "async function send(){const t=inp.value.trim();if(!t)return;inp.value='';inp.disabled=snd.disabled=true;" \
 "const u=add('<i>enviando…</i>','user');u.textContent=t;const b=add('','bot');" \
 "const st=document.createElement('span');st.className='meta';st.textContent='generando…';log.appendChild(st);" \
-"let out='';try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t,temp:parseFloat(tt.value),n:256})});" \
+"let out='';try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t,temp:parseFloat(tt.value),n:256,agent:ag.checked})});" \
 "if(!r.ok){st.textContent='error '+r.status+' '+await r.text();b.textContent='(Error de conexion)';return;}" \
 "const rd=r.body.getReader(),dc=new TextDecoder();let buf='';" \
 "for(;;){const{done,value}=await rd.read();if(done)break;buf+=dc.decode(value,{stream:true});" \
 "let i;while((i=buf.indexOf('\\n'))>=0){const l=buf.slice(0,i);buf=buf.slice(i+1);" \
 "if(l.startsWith('data: ')){const o=JSON.parse(l.slice(6));" \
 "if(o.type==='chunk'){out+=o.text;b.textContent=out;log.scrollTop=log.scrollHeight;}" \
+"else if(o.type==='tool'){const d=document.createElement('div');d.className='msg tool';d.textContent=o.text;b.style.display='inline-block';log.appendChild(d);log.scrollTop=log.scrollHeight;}" \
 "else if(o.type==='done'){st.textContent='OK · '+o.tokens+' tokens · '+Math.round(o.ms/1000)+'s';}" \
 "else if(o.type==='error'){st.textContent='error: '+o.text;}}}}}catch(e){st.textContent='error: '+e;}" \
 "inp.disabled=snd.disabled=false;inp.focus();}" \
@@ -2087,6 +2093,152 @@ static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std:
 static void sse_event(int fd, const std::string &type, const std::string &text) {
     std::string e = std::string("data: {\"type\":\"") + type + "\",\"text\":\"" + text + "\"}\n\n";
     tcp_send(fd, e.data(), e.size());
+}
+
+// ---------------------------------------------------------------- PARTE 9
+// Agente ReAct en la WebUI (iteracion 6): sin IPC, en el mismo proceso. El
+// modelo puede pedir "[ACTION: <tool> <arg>]", KORE ejecuta la herramienta
+// (sh/python por fork+execve) y reinyecta el resultado como turno de usuario.
+
+static std::string react_trim(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static double now_s() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+static const char *const KORE_AGENT_SYSTEM =
+    "You are KORE, an autonomous assistant with access to tools.\n"
+    "When you need real data or want to run code, request an action on its own line EXACTLY as:\n"
+    "[ACTION: sh <bash command or script>]\n"
+    "[ACTION: python <python3 source code>]\n"
+    "The tool then executes and its output is provided to you. Use that output to answer.\n"
+    "Never wrap tools in quotes or backticks; the brackets delimit the entire request.\n"
+    "If no tool is needed, just answer directly.";
+
+struct ReactResult {
+    bool ok = false;
+    bool timed_out = false;
+    std::string out;
+};
+
+// Ejecuta "<tool> <arg>" capturando stdout+stderr (timeout 30s, salida capada).
+static ReactResult react_exec(const std::string &tool, const std::string &arg) {
+    ReactResult r;
+    const size_t max_out = 4096;
+    int pfd[2];
+    if (pipe(pfd) < 0) { r.out = "error: pipe"; return r; }
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    const pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); r.out = "error: fork"; return r; }
+    if (pid == 0) {
+        dup2(pfd[1], 1); dup2(pfd[1], 2);
+        close(pfd[0]); close(pfd[1]);
+        if (tool == "python" || tool == "python3") execl("/usr/bin/python3", "python3", "-c", arg.c_str(), (char *)0);
+        else                                      execl("/bin/sh", "sh", "-c", arg.c_str(), (char *)0);
+        _exit(127);
+    }
+    close(pfd[1]);
+    const double deadline = now_s() + 30.0;
+    char tmp[4096];
+    for (;;) {
+        if (now_s() > deadline) { kill(pid, SIGKILL); r.timed_out = true; break; }
+        struct pollfd p = {pfd[0], POLLIN | POLLHUP, 0};
+        const int pr = poll(&p, 1, 250);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr > 0 && (p.revents & POLLIN)) {
+            ssize_t n;
+            while ((n = read(pfd[0], tmp, sizeof(tmp))) > 0 && r.out.size() < max_out)
+                r.out.append(tmp, (size_t)n);
+        }
+        int status = 0;
+        const pid_t wr = waitpid(pid, &status, WNOHANG);
+        if (wr == pid) {
+            ssize_t n;
+            while ((n = read(pfd[0], tmp, sizeof(tmp))) > 0 && r.out.size() < max_out) r.out.append(tmp, (size_t)n);
+            r.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            break;
+        }
+        if (wr < 0) { r.ok = false; break; }
+    }
+    if (r.out.size() > max_out) { r.out = r.out.substr(0, max_out); r.out += "\n[tool out recortada]"; }
+    return r;
+}
+
+// Genera un turno de agente completo a partir de los ids ya construidos
+// (con system de agente). Emite por SSE: chunk (texto), tool (acciones).
+// Devuelve los tokens generados o -1 ante error.
+static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &ids0, long nmax) {
+    std::string err;
+    if (!prefill(s, ids0, &err)) { sse_event(cfd, "error", "prefill: " + err); return -1; }
+    fprintf(stderr, "[react] turno: %zu ids\n", ids0.size());
+
+    auto sse_chunk = [&](const std::string &t) { sse_event(cfd, "chunk", json_escape(t)); };
+
+    std::string cur;                       // texto bruto del asistente en curso
+    size_t emit = 0;                       // ya enviado como chunk (cola segura de 64 B atrás)
+    size_t pend = std::string::npos;       // "[ACTION:" abierto sin ']'
+    long total = 0;
+    bool finished = false;
+
+    while (!finished) {
+        // ---- leer siguiente token: mientras haya marcador pendiente o ventana corta
+        if (pend != std::string::npos || cur.size() - emit < 256) {
+            if (total >= nmax) { fprintf(stderr, "[react] tope de tokens %ld\n", total); break; }
+            int tok = 0; std::string piece; bool full = false;
+            const int r = gen_step(s, &tok, &piece, &full);
+            if (r == 1) { cur += piece; total++; }
+            else if (r == 0) { fprintf(stderr, "[react] eos\n"); finished = true; continue; }
+            else { sse_event(cfd, "error", "fallo en el forward"); return -1; }
+        }
+
+        // ---- buscar "[ACTION: ...]" en la ventana retenida
+        const size_t base = (pend != std::string::npos) ? pend : emit;
+        const size_t so = cur.find("[ACTION:", base);
+        if (so == std::string::npos) {
+            pend = std::string::npos;
+            const size_t safe = cur.size() > 64 ? cur.size() - 64 : 0;
+            if (safe > emit) { sse_chunk(cur.substr(emit, safe - emit)); emit = safe; }
+            continue;
+        }
+        const size_t eo = cur.find(']', so + 8);
+        if (eo == std::string::npos) {
+            if (cur.size() - so > 512) pend = std::string::npos;   // marcador ilegible: seguir como texto
+            else pend = so;
+            continue;
+        }
+        const std::string body = react_trim(cur.substr(so + 8, eo - so - 8));
+        if (!body.empty()) {
+            if (so > emit) { sse_chunk(cur.substr(emit, so - emit)); }
+            emit = so + 1;
+            size_t sp = body.find_first_of(" \t\r\n");
+            std::string tool = body, arg;
+            if (sp != std::string::npos) { tool = body.substr(0, sp); arg = react_trim(body.substr(sp + 1)); }
+            tool = react_trim(tool);
+
+            const ReactResult res = react_exec(tool, arg);
+            const std::string out = (res.ok || !res.out.empty()) ? res.out : "(sin salida)";
+            fprintf(stderr, "[react] accion tool=%s arg=%s out=%zu error?%d\n", tool.c_str(), arg.c_str(), out.size(), !res.ok);
+            sse_event(cfd, "tool", json_escape("$ " + tool + (arg.empty() ? "" : " " + arg) + "\n" + out));
+
+            std::vector<int32_t> rinj;
+            chat_ids_user_only(s.v, out, rinj);
+            fprintf(stderr, "[react] reinyectando %zu tokens\n", rinj.size());
+            if (!prefill(s, rinj, &err)) { sse_event(cfd, "error", "reinyeccion: " + err); return -1; }
+        }
+        cur.erase(0, eo + 1);              // el resto tras ']' se descarta: el modelo
+        emit = 0;                          // continúa desde el resultado inyectado
+        pend = std::string::npos;
+    }
+    if (emit < cur.size()) sse_chunk(cur.substr(emit));
+    fprintf(stderr, "[react] fin total=%ld\n", total);
+    s.generating = false;
+    return (int)total;
 }
 
 // POST /v1/embeddings (API OpenAI): devuelve el embedding L2 del último token.
@@ -2233,6 +2385,8 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                 const std::string prompt = json_get_string(body, "prompt");
                 double temp = json_get_number(body, "temp", s.temp);
                 const double nmax = json_get_number(body, "n", 256);
+                const bool agent = body.find("\"agent\":true") != std::string::npos ||
+                                  body.find("\"agent\": true") != std::string::npos;
                 if (prompt.empty() || nmax <= 0) {
                     http_status(cfd, "400 Bad Request", "application/json", "{\"error\":\"prompt vacio\"}");
                 } else {
@@ -2241,9 +2395,23 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                         http_status(cfd, "409 Conflict", "application/json", "{\"error\":\"otra generacion en curso\"}");
                     } else {
                         s.temp = (float)temp;
+                        std::string err;
+                        if (agent) {                                   // turno de agente: prefill dentro del bucle
+                            http_stream_head(cfd, "200 OK", "text/event-stream");
+                            const double t0 = now_ms();
+                            std::vector<int32_t> ids;
+                            chat_ids(s.v, KORE_AGENT_SYSTEM, prompt, ids);
+                            const int n = web_react_turn(cfd, s, ids, (long)nmax);
+                            s.generating = false;
+                            const double ms = now_ms() - t0;
+                            std::string done = "{\"type\":\"done\",\"tokens\":" + std::to_string(std::max(0, n)) +
+                                               ",\"ms\":" + std::to_string((uint64_t)ms) + "}\n\n";
+                            tcp_send(cfd, done.data(), done.size());
+                            close(cfd);
+                            return;
+                        }
                         std::vector<int32_t> ids;
                         chat_ids(s.v, s.system_msg, prompt, ids);
-                        std::string err;
                         if (!prefill(s, ids, &err)) {
                             http_status(cfd, "400 Bad Request", "application/json",
                                         (std::string)"{\"error\":\"" + json_escape(err) + "\"}");
