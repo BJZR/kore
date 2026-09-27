@@ -1970,24 +1970,30 @@ static std::string json_escape(const std::string &s) {
 "main{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}" \
 ".msg{max-width:780px;white-space:pre-wrap;line-height:1.55;font-size:15px;border-radius:10px;padding:10px 14px}" \
 ".user{align-self:flex-end;background:#2b3a66;color:#eef} .bot{align-self:flex-start;background:#1d2130;color:#e7e9ef}" \
-"footer{padding:10px;background:#171923;border-top:1px solid #262a38;display:flex;gap:8px}" \
-"textarea{flex:1;resize:none;background:#0d0f16;color:#e7e9ef;border:1px solid #2a2f40;border-radius:8px;padding:8px;font-size:14px}" \
+"footer{padding:10px;background:#171923;border-top:1px solid #262a38;display:flex;align-items:center;gap:8px;flex-wrap:wrap}" \
+"textarea{flex:1;min-width:240px;resize:none;background:#0d0f16;color:#e7e9ef;border:1px solid #2a2f40;border-radius:8px;padding:8px;font-size:14px}" \
 "button{background:#3b4a8f;border:0;color:#fff;border-radius:8px;padding:8px 14px;cursor:pointer}" \
 "button:disabled{opacity:.45}button.sec{background:#262a38}" \
+".tp{display:flex;align-items:center;gap:6px;color:#9aa3ba;font-size:12px;padding:0 10px}" \
+".tp input{width:90px;accent-color:#3b4a8f}.tp b{min-width:34px;text-align:right;font-variant-numeric:tabular-nums}" \
+".step{display:none}" \
 ".meta{max-width:780px;color:#6f7890;font-size:12px}.spin{display:inline-block;width:12px;height:12px;border:2px solid #3b4a8f;border-top-color:#8fa6ff;border-radius:50%;animation:g 0.8s linear infinite;vertical-align:-2px;margin-right:6px}@keyframes g{to{transform:rotate(360deg)}}</style></head>" \
 "<body><header><b>KORE</b> &mdash; <span id=meta>...</span></header>" \
 "<main id=log></main>" \
 "<footer><textarea id=in rows=1 placeholder='Escribe tu mensaje (Enter para enviar, Shift+Enter salto de linea)'></textarea>" \
+"<span class=tp><label for=tt>temp</label><input id=tt type=range min=0 max=1.5 step=0.05 value=0.3><b id=tv>0.30</b></span>" \
 "<button id=snd>Enviar</button><button class=sec id=rst>Nueva</button></footer>" \
 "<script>" \
 "const meta=document.getElementById('meta'),log=document.getElementById('log')," \
-"inp=document.getElementById('in'),snd=document.getElementById('snd'),rst=document.getElementById('rst');" \
+"inp=document.getElementById('in'),snd=document.getElementById('snd'),rst=document.getElementById('rst')," \
+"tt=document.getElementById('tt'),tv=document.getElementById('tv');" \
+"tt.oninput=()=>tv.textContent=parseFloat(tt.value).toFixed(2);" \
 "fetch('/api/state').then(r=>r.json()).then(s=>meta.textContent='funcionando: '+s.name+' ctx='+s.ctx+' hilos='+s.threads+(s.avx2?' AVX2':' escalar')+' temp='+s.temp);" \
 "function add(msg,cls){const d=document.createElement('div');d.className='msg '+cls;d.textContent=msg;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}" \
 "async function send(){const t=inp.value.trim();if(!t)return;inp.value='';inp.disabled=snd.disabled=true;" \
 "const u=add('<i>enviando…</i>','user');u.textContent=t;const b=add('','bot');" \
 "const st=document.createElement('span');st.className='meta';st.textContent='generando…';log.appendChild(st);" \
-"let out='';try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t,temp:0.7,n:256})});" \
+"let out='';try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t,temp:parseFloat(tt.value),n:256})});" \
 "if(!r.ok){st.textContent='error '+r.status+' '+await r.text();b.textContent='(Error de conexion)';return;}" \
 "const rd=r.body.getReader(),dc=new TextDecoder();let buf='';" \
 "for(;;){const{done,value}=await rd.read();if(done)break;buf+=dc.decode(value,{stream:true});" \
