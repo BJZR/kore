@@ -8,6 +8,7 @@ kore_client
 kore_orch
 kore_tui
 /bin/
+/run/
 
 # modelo (grande) y artefactos
 *.gguf

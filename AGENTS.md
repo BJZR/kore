@@ -7,6 +7,11 @@ Motor LLM plein-c++ standalone (sin dependencias) + IPC Core/Orchestrator/TUI + 
 - `./build.sh --install DIR` copia a `DIR/bin`; `./build.sh --uninstall DIR` los elimina; `./build.sh --clean` borra `bin/`.
 - Compilar solo el motor: `g++ -std=c++20 -O3 -pthread -Wall -Wextra kore.cpp -o kore`.
 
+## Centro de control (`./kore.sh`, sin dependencias)
+- `./kore.sh` → menú interactivo (whiptail; fallback textual). Subcomandos scriptables: `ask [texto]`, `web start|stop|restart|status|logs`, `agent [texto]`, `api [prompt]`, `ipc start|stop|status`, `tui`, `build [--install|--uninstall|--clean]`, `status`, `config`, `stop-all`.
+- Config por entorno o `./kore.conf`: `KORE_MODEL KORE_HOST KORE_PORT KORE_CTX KORE_THREADS KORE_TEMP KORE_N KORE_SYSTEM KORE_SOCK_CORE KORE_SOCK_ORCH`; logs/pids en `./run/`.
+- Detección automática del `*.gguf`; un solo proceso de servidor (pidfile + SSL probe); el agente/API requieren el servidor en marcha.
+
 ## Uso rápido
 - `./kore modelo.gguf "prompt" -n 30 --temp 0` (contexto por defecto 8192, KV ≈ 896 MiB; `--ctx N` para menos; Qwen2.5 soporta 32k nativo).
 - WebUI (iteración 4/6): `./kore modelo.gguf --web 127.0.0.1:8080` → abre `http://127.0.0.1:8080`.
