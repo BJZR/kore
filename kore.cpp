@@ -1680,6 +1680,9 @@ struct ChatSession {
     std::string system_msg = "You are a helpful assistant.";
     std::string name;                   // ruta del modelo (para la UI)
     bool generating = false;
+    std::string p_tool, p_arg;          // herramienta pendiente de aprobación (gate de seguridad)
+    bool p_waiting = false;
+    int p_id = 0, p_next = 1;
 };
 
 static void build_chat_message(const Vocab &v, const std::string &system_msg,
@@ -2118,11 +2121,8 @@ static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std:
 "tt.oninput=()=>tv.textContent=parseFloat(tt.value).toFixed(2);" \
 "fetch('/api/state').then(r=>r.json()).then(s=>meta.textContent='funcionando: '+s.name+' ctx='+s.ctx+' hilos='+s.threads+(s.avx2?' AVX2':' escalar')+' temp='+s.temp);" \
 "function add(msg,cls){const d=document.createElement('div');d.className='msg '+cls;d.textContent=msg;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}" \
-"async function send(){const t=inp.value.trim();if(!t)return;inp.value='';inp.disabled=snd.disabled=true;" \
-"const u=add('<i>enviando…</i>','user');u.textContent=t;const b=add('','bot');" \
-"const st=document.createElement('span');st.className='meta';st.textContent='generando…';log.appendChild(st);" \
-"let out='';try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:t,temp:parseFloat(tt.value),n:256,agent:ag.checked})});" \
-"if(!r.ok){st.textContent='error '+r.status+' '+await r.text();b.textContent='(Error de conexion)';return;}" \
+"async function f9(url,opt,b,st,start){let out='';try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(opt)});" \
+"if(!r.ok){st.textContent='error '+r.status+' '+await r.text();b.textContent='(Error de conexion)';return start.pending=0;}" \
 "const rd=r.body.getReader(),dc=new TextDecoder();let buf='';" \
 "for(;;){const{done,value}=await rd.read();if(done)break;buf+=dc.decode(value,{stream:true});" \
 "let i;while((i=buf.indexOf('\\n'))>=0){const l=buf.slice(0,i);buf=buf.slice(i+1);" \
@@ -2130,9 +2130,19 @@ static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std:
 "if(o.type==='chunk'){out+=o.text;b.textContent=out;log.scrollTop=log.scrollHeight;}" \
 "else if(o.type==='tool'){const d=document.createElement('div');d.className='msg tool';d.textContent=o.text;b.style.display='inline-block';log.appendChild(d);log.scrollTop=log.scrollHeight;}" \
 "else if(o.type==='meta'){st.textContent=o.text+'…';}" \
+"else if(o.type==='confirm'){start.pending=1;const d=document.createElement('div');d.className='msg tool';d.textContent=o.text;b.style.display='inline-block';log.appendChild(d);" \
+"const row=document.createElement('div');row.className='msg tool';const per=document.createElement('button');per.textContent='Permitir';" \
+"const can=document.createElement('button');can.textContent='Cancelar';row.appendChild(per);row.appendChild(can);log.appendChild(row);" \
+"per.onclick=()=>{per.disabled=can.disabled=true;row.textContent='pendiente…';start.pending=0;f9('/api/approve',{allow:true},b,st,start);};" \
+"can.onclick=()=>{per.disabled=can.disabled=true;row.textContent='pendiente…';start.pending=0;f9('/api/approve',{allow:false},b,st,start);};" \
+"log.scrollTop=log.scrollHeight;}" \
 "else if(o.type==='done'){st.textContent='OK · '+o.tokens+' tokens · '+Math.round(o.ms/1000)+'s';}" \
 "else if(o.type==='error'){st.textContent='error: '+o.text;}}}}}catch(e){st.textContent='error: '+e;}" \
-"inp.disabled=snd.disabled=false;inp.focus();}" \
+"if(!start.pending){inp.disabled=snd.disabled=false;inp.focus();}}" \
+"function send(){const t=inp.value.trim();if(!t)return;inp.value='';inp.disabled=snd.disabled=true;" \
+"const u=add('<i>enviando…</i>','user');u.textContent=t;const b=add('','bot');" \
+"const st=document.createElement('span');st.className='meta';st.textContent='generando…';log.appendChild(st);" \
+"f9('/api/chat',{prompt:t,temp:parseFloat(tt.value),n:256,agent:ag.checked},b,st,{pending:0});}" \
 "inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});" \
 "snd.onclick=send;rst.onclick=async()=>{await fetch('/api/reset',{method:'POST'});log.innerHTML='';};</script></body></html>"
 
@@ -2152,6 +2162,63 @@ static std::string react_trim(const std::string &s) {
     if (a == std::string::npos) return "";
     const size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
+}
+
+// Quita una capa de comillas exteriores ('...' o "...") si el interior no las vuelve a usar.
+static std::string react_unquote(std::string s) {
+    s = react_trim(s);
+    if (s.size() >= 2) {
+        const char q = s.front();
+        if ((q == '"' || q == '\'') && s.back() == q) {
+            if (q == '"' && s.find('"', 1) != s.size() - 1) return s;
+            return s.substr(1, s.size() - 2);
+        }
+    }
+    return s;
+}
+
+// Divide el cuerpo de una accion. kind: 0=sh -c <arg> 1=python3 -c <arg> 2=linea de shell completa.
+// El modelo a veces emite la forma libre ("touch texto.txt", "echo hola") o la forma
+// envuelta ("sh -c \"ls -la\"" / "python -c \"print(1)\""): ambas se normalizan.
+static void react_split(const std::string &body, std::string &tool, std::string &arg, int &kind) {
+    size_t sp = body.find_first_of(" \t\r\n");
+    std::string t0 = body, rest;
+    if (sp != std::string::npos) { t0 = body.substr(0, sp); rest = react_trim(body.substr(sp + 1)); }
+    t0 = react_trim(t0);
+    kind = 2;
+    if (t0 == "python" || t0 == "python3") {
+        kind = 1;
+        if (rest.rfind("-c", 0) == 0) rest = react_trim(rest.substr(2));
+        tool = "python"; arg = react_unquote(rest);
+        return;
+    }
+    if (t0 == "sh" || t0 == "bash") {
+        kind = 0;
+        if (rest.rfind("-c", 0) == 0) rest = react_trim(rest.substr(2));
+        tool = "sh"; arg = react_unquote(rest);
+        return;
+    }
+    tool = t0; arg = rest;           // forma libre: la ejecutable completa es la propia body
+}
+
+// Heuristica de comandos destructivos: se exige aprobacion antes de ejecutarlos.
+static bool react_danger(int kind, const std::string &tool, const std::string &arg, const std::string &body) {
+    const std::string line = (kind == 2) ? body : tool + (arg.empty() ? "" : " " + arg);
+    auto has = [&](const char *p) { return line.find(p) != std::string::npos; };
+    if (has("rm -rf") || has("rm -fr") || has("rm -r /") || has("rm -R /")) return true;
+    static const char *pats[] = {
+        "mkfs", "fdisk", "dd if=", "of=/dev/sd", "of=/dev/mmcblk", "> /dev/sd", "/dev/sda", "/dev/sdb",
+        "sudo ", "shutdown", "reboot", "poweroff", "halt", ":(){", "kill -9", "kill -s 9", "pkill",
+        "userdel", "deluser", "passwd ", "chmod -R 777 /", "chown -R /", "cryptsetup", "mkswap",
+        "chattr -", "> /etc/", ">> /etc/", "mv /", "cp -r /", "rsync -r /",
+    };
+    for (size_t i = 0; i < sizeof(pats) / sizeof(pats[0]); i++) if (has(pats[i])) return true;
+    if (kind == 1) {
+        static const char *pp[] = { "os.remove(", "os.unlink(", "shutil.rmtree(", "os.system(",
+                                    "os.popen(", "subprocess", "eval(", "exec(", "os.exec(" };
+        for (size_t i = 0; i < sizeof(pp) / sizeof(pp[0]); i++) if (line.find(pp[i]) != std::string::npos) return true;
+    }
+    return false;
 }
 
 static double now_s() {
@@ -2218,12 +2285,23 @@ static ReactResult react_exec(const std::string &tool, const std::string &arg) {
 }
 
 // Genera un turno de agente completo a partir de los ids ya construidos
-// (con system de agente). Emite por SSE: chunk (texto), tool (acciones).
-// Devuelve los tokens generados o -1 ante error.
-static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &ids0, long nmax) {
+// (con system de agente). Emite por SSE: chunk (texto), tool (acciones),
+// confirm (aprobacion pendiente). Devuelve los tokens generados, -1 ante error
+// o -2 si una accion peligrosa quedo pendiente de aprobacion (s.p_waiting).
+static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &ids0, long nmax,
+                          bool resume, const std::string &inject) {
     std::string err;
-    if (!prefill(s, ids0, &err)) { sse_event(cfd, "error", "prefill: " + err); return -1; }
-    fprintf(stderr, "[react] turno: %zu ids\n", ids0.size());
+    if (resume) {
+        if (!inject.empty()) {
+            std::vector<int32_t> rinj0;
+            chat_ids_user_only(s.v, inject, rinj0);
+            if (!prefill(s, rinj0, &err)) { sse_event(cfd, "error", "reinyeccion: " + err); return -1; }
+        }
+        fprintf(stderr, "[react] turno reanudado\n");
+    } else {
+        if (!prefill(s, ids0, &err)) { sse_event(cfd, "error", "prefill: " + err); return -1; }
+        fprintf(stderr, "[react] turno: %zu ids\n", ids0.size());
+    }
 
     auto sse_chunk = [&](const std::string &t) { sse_event(cfd, "chunk", json_escape(t)); };
 
@@ -2263,15 +2341,28 @@ static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &i
         if (!body.empty()) {
             if (so > emit) { sse_chunk(cur.substr(emit, so - emit)); }
             emit = so + 1;
-            size_t sp = body.find_first_of(" \t\r\n");
-            std::string tool = body, arg;
-            if (sp != std::string::npos) { tool = body.substr(0, sp); arg = react_trim(body.substr(sp + 1)); }
-            tool = react_trim(tool);
+            std::string tool, arg; int kind = 2;
+            react_split(body, tool, arg, kind);
+            const std::string line = (kind == 2) ? body : tool + (arg.empty() ? "" : " " + arg);
 
-            const ReactResult res = react_exec(tool, arg);
+            if (react_danger(kind, tool, arg, body)) {
+                s.p_tool = (kind == 2) ? "sh" : (kind == 1 ? "python" : tool);
+                s.p_arg = (kind == 2) ? body : arg;
+                s.p_waiting = true;
+                s.p_id = s.p_next++;
+                fprintf(stderr, "[react] peligro: %s\n", line.c_str());
+                sse_event(cfd, "confirm", json_escape("$ " + line + "\n(comando potencialmente peligroso; aprobacion requerida)"));
+                pend = std::string::npos;
+                return -2;
+            }
+
+            std::string rtool = tool, rarg = arg;
+            if (kind == 2) rtool = "sh", rarg = body;
+            const ReactResult res = react_exec(rtool, rarg);
             const std::string out = (res.ok || !res.out.empty()) ? res.out : "(sin salida)";
-            fprintf(stderr, "[react] accion tool=%s arg=%s out=%zu error?%d\n", tool.c_str(), arg.c_str(), out.size(), !res.ok);
-            sse_event(cfd, "tool", json_escape("$ " + tool + (arg.empty() ? "" : " " + arg) + "\n" + out));
+            fprintf(stderr, "[react] accion tool=%s arg=%s out=%zu error?%d\n", rtool.c_str(),
+                    rarg.size() > 96 ? rarg.substr(0, 96).c_str() : rarg.c_str(), out.size(), !res.ok);
+            sse_event(cfd, "tool", json_escape("$ " + line + "\n" + out));
 
             std::vector<int32_t> rinj;
             chat_ids_user_only(s.v, out, rinj);
@@ -2418,8 +2509,45 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                     std::lock_guard<std::mutex> lk(mu);
                     s.conv.clear();
                     s.generating = false;
+                    s.p_waiting = false;
+                    s.p_tool.clear(); s.p_arg.clear();
                 }
                 http_status(cfd, "200 OK", "application/json", "{\"ok\":true}");
+            } else if (method == "POST" && path == "/api/approve") {
+                std::lock_guard<std::mutex> lk(mu);
+                if (!s.p_waiting || !s.generating) {
+                    http_status(cfd, "409 Conflict", "application/json", "{\"error\":\"no hay comando pendiente de aprobacion\"}");
+                } else {
+                    const bool allow =
+                        body.find("\"allow\":true") != std::string::npos || body.find("\"allow\": true") != std::string::npos;
+                    const std::string ptool = s.p_tool, parg = s.p_arg;
+                    s.p_waiting = false;
+                    s.p_tool.clear(); s.p_arg.clear();
+                    std::string inject;
+                    if (allow) {
+                        const ReactResult res = react_exec(ptool, parg);
+                        inject = (res.ok || !res.out.empty()) ? res.out : "(sin salida)";
+                        fprintf(stderr, "[react] aprobado tool=%s arg=%s\n", ptool.c_str(),
+                                parg.size() > 96 ? parg.substr(0, 96).c_str() : parg.c_str());
+                    } else {
+                        inject = "(comando cancelado por el usuario; no lo ejecutaste)";
+                        fprintf(stderr, "[react] comando cancelado por el usuario\n");
+                    }
+                    http_stream_head(cfd, "200 OK", "text/event-stream");
+                    sse_event(cfd, "tool", json_escape("$ " + ptool + (parg.empty() ? "" : " " + parg) + "\n" + inject));
+                    const double t0 = now_ms();
+                    const long nmax = 256;
+                    const int n = web_react_turn(cfd, s, std::vector<int32_t>(), nmax, true, inject);
+                    s.generating = (n == -2);
+                    const double ms = now_ms() - t0;
+                    std::string done = "{\"type\":\"done\",\"tokens\":" + std::to_string(std::max(0, n)) +
+                                       ",\"ms\":" + std::to_string((uint64_t)ms) +
+                                       (n == -2 ? ",\"pending\":true}" : "}\n\n");
+                    if (n != -2) done += "\n\n";
+                    tcp_send(cfd, done.data(), done.size());
+                    close(cfd);
+                    return;
+                }
             } else if (method == "GET" && path == "/v1/models") {
                 http_status(cfd, "200 OK", "application/json",
                     "{\"object\":\"list\",\"data\":[{\"id\":\"" + json_escape(s.name) +
@@ -2456,11 +2584,13 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                             const double t0 = now_ms();
                             std::vector<int32_t> ids;
                             chat_ids(s.v, KORE_AGENT_SYSTEM, prompt, ids);
-                            const int n = web_react_turn(cfd, s, ids, (long)nmax);
-                            s.generating = false;
+                            const int n = web_react_turn(cfd, s, ids, (long)nmax, false, "");
+                            s.generating = (n == -2);                  // turno abierto mientras haya aprobacion pendiente
                             const double ms = now_ms() - t0;
                             std::string done = "{\"type\":\"done\",\"tokens\":" + std::to_string(std::max(0, n)) +
-                                               ",\"ms\":" + std::to_string((uint64_t)ms) + "}\n\n";
+                                               ",\"ms\":" + std::to_string((uint64_t)ms) +
+                                               (n == -2 ? ",\"pending\":true}" : "}\n\n");
+                            if (n != -2) done += "\n\n";
                             tcp_send(cfd, done.data(), done.size());
                             close(cfd);
                             return;

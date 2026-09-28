@@ -125,6 +125,7 @@ Abre `http://127.0.0.1:8080`: chat con streaming SSE, control de temperatura, mo
 | `GET /` | WebUI (HTML/JS autocontenido). |
 | `GET /api/state` | estado: modelo, ctx, hilos, AVX2, temp. |
 | `POST /api/chat` | chat SSE: `{prompt, temp, n, agent}`. Eventos `chunk`, `tool`, `meta`, `done`; `409` si otra generación está en curso. |
+| `POST /api/approve` | decide un comando pendiente: `{"allow":true|false}`; reanuda el turno del agente por SSE (`pending:true` en `done` si surgen más aprobaciones). |
 | `POST /api/reset` | reinicia la conversación (la KV se reconstruye). |
 | `GET /v1/models` | lista el modelo. |
 | `POST /v1/chat/completions` | API OpenAI (no-stream con `usage`, o `stream: true` SSE estilo OpenAI + `[DONE]`). |
@@ -161,6 +162,9 @@ El agente usa el protocolo `[ACTION: tool arg]` ejecutado con `sh` o `python` in
 ```
 
 Tools: `sh <comando o script>` y `python <código>` (python3). Timeout de ejecución de 30 s y salida limitada a 4 KiB. Si el modelo no pide herramienta, responde directamente.
+
+- **Forma libre**: además de `[ACTION: sh <cmd>]` / `[ACTION: python <src>]`, el modelo puede emitir líneas de shell directas (`touch x.txt`, `echo hola`) o la forma envuelta (`sh -c "…"`, `python -c "…"`); el parser las normaliza y ejecuta la línea completa.
+- **Aprobación de comandos peligrosos**: las acciones destructivas (`rm -rf`, `mkfs`, `dd`, `sudo`, `shutdown`, escrituras a `/dev`, etc.) se bloquean por defecto. La WebUI muestra «Permitir/Cancelar» y `kore.sh agent` pide confirmación `[s/N]`; la API lo resuelve con `POST /api/approve {"allow":true|false}`:
 
 ---
 

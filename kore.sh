@@ -106,22 +106,40 @@ agent_turn() {   # agente ReAct vía /api/chat del servidor
     [[ -z "$text" ]] && { read -r -p "Agente: " text || true; }
     [[ -z "$text" ]] && die "prompt vacío"
     ensure_server
-    curl -s -N -X POST "$base/api/chat" -H 'Content-Type: application/json' \
-        -d "$(python3 -c 'import json,sys
+    local m="$(mktemp)"; trap 'rm -f "$m"' EXIT
+    local url="/api/chat" payload rounds=0 allowed
+    payload="$(python3 -c 'import json,sys
 d={"prompt":sys.argv[1],"temp":'"$TEMP"',"n":'"$N"',"agent":True}
-print(json.dumps(d,ensure_ascii=False))' "$text")" \
-        | python3 -u -c 'import sys,re,json
+print(json.dumps(d,ensure_ascii=False))' "$text")"
+    while :; do
+        rm -f "$m"
+        curl -s -N -X POST "$base$url" -H 'Content-Type: application/json' -d "$payload" \
+            | CONF_MARK="$m" python3 -u -c 'import sys,json,os
+mtr=os.environ.get("CONF_MARK","")
 for ln in sys.stdin:
-    if ln.startswith("data: "):
-        try: o = json.loads(ln[6:])
-        except Exception: continue
-        t = o.get("type")
-        if t == "chunk":       sys.stdout.write(o.get("text","")); sys.stdout.flush()
-        elif t == "tool":      print("\n\x1b[1;36m[herramienta]\x1b[0m\n" + o.get("text",""))
-        elif t == "meta":      print("\n\x1b[1;33m"+o.get("text","")+"\x1b[0m")
-        elif t == "done":      print("\n\x1b[2m["+str(o.get("tokens"))+" tok, "+str(round(o.get("ms",0)/1000))+" s]\x1b[0m")
-        elif t == "error":     print("\n\x1b[1;31merror: "+o.get("text","")+"\x1b[0m")'
-    echo
+    if not ln.startswith("data: "): continue
+    try: o = json.loads(ln[6:])
+    except Exception: continue
+    t = o.get("type")
+    if t == "chunk":   sys.stdout.write(o.get("text","")); sys.stdout.flush()
+    elif t == "tool":  print("\n\x1b[1;36m[herramienta]\x1b[0m\n" + o.get("text",""))
+    elif t == "meta":  print("\n\x1b[1;33m"+o.get("text","")+"\x1b[0m")
+    elif t == "confirm":
+        print("\n\x1b[1;38;5;208m[permiso requerido]\x1b[0m " + o.get("text",""))
+        print("¿ejecutar? [s/N]", file=sys.stderr)
+        if mtr: open(mtr,"w").write("1")
+    elif t == "done":  print("\n\x1b[2m["+str(o.get("tokens"))+" tok, "+str(round(o.get("ms",0)/1000))+" s]\x1b[0m")
+    elif t == "error": print("\n\x1b[1;31merror: "+o.get("text","")+"\x1b[0m")' 2>/dev/null
+        echo
+        [[ -s "$m" ]] || break
+        read -r -p "¿Permitir que KORE ejecute el comando? [s/N] " allowed || allowed=n
+        rounds=$((rounds + 1))
+        [[ "$rounds" -ge 8 ]] && { warn "demasiadas aprobaciones pendientes; abortando"; break; }
+        url="/api/approve"
+        payload="$(python3 -c 'import json,sys
+print(json.dumps({"allow":("'"$allowed"'"[0:1].lower() in ("s","y"))}))')"
+    done
+    trap - EXIT; rm -f "$m"
 }
 
 # ---------------- servidor WebUI + OpenAI --------------------------------------------
