@@ -161,7 +161,7 @@ El agente usa el protocolo `[ACTION: tool arg]` ejecutado con `sh` o `python` in
 # …
 ```
 
-Tools: `sh <comando o script>` y `python <código>` (python3). Timeout de ejecución de 30 s y salida limitada a 4 KiB. Si el modelo no pide herramienta, responde directamente.
+Tools: `sh <comando o script>` y `python <código>` (python3). El shell usado es el **shell por defecto del usuario** (`$SHELL`; aquí `zsh`), no `/bin/sh` fijo — así las construcciones de tu shell (variables, `[[ ]]`, módulos, etc.) funcionan tal cual. Timeout de ejecución de 30 s y salida limitada a 4 KiB. Si el modelo no pide herramienta, responde directamente.
 
 - **Forma libre**: además de `[ACTION: sh <cmd>]` / `[ACTION: python <src>]`, el modelo puede emitir líneas de shell directas (`touch x.txt`, `echo hola`) o la forma envuelta (`sh -c "…"`, `python -c "…"`); el parser las normaliza y ejecuta la línea completa.
 - **Aprobación de comandos peligrosos**: las acciones destructivas (`rm -rf`, `mkfs`, `dd`, `sudo`, `shutdown`, escrituras a `/dev`, etc.) se bloquean por defecto. La WebUI muestra «Permitir/Cancelar» y `kore.sh agent` pide confirmación `[s/N]`; la API lo resuelve con `POST /api/approve {"allow":true|false}`:

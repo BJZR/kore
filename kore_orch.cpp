@@ -108,7 +108,17 @@ struct ToolResult {
     std::string out;
 };
 
-// Lanza "<tool> <arg>" con fork/execve (sh -c o python3 -c) y captura stdout+stderr.
+// Lanza "<tool> <arg>" con fork/execve (shell del usuario o python3 -c) y captura stdout+stderr.
+static const char *shell_path = "/bin/sh";
+static const char *shell_name = "sh";
+static void init_shell() {
+    const char *s = getenv("SHELL");
+    if (s && s[0] && access(s, X_OK) == 0) {
+        shell_path = s;
+        const char *b = strrchr(s, '/');
+        shell_name = b ? b + 1 : s;
+    }
+}
 static ToolResult exec_tool(const std::string &tool, const std::string &arg, size_t max_out) {
     ToolResult r;
     int pfd[2];
@@ -123,7 +133,7 @@ static ToolResult exec_tool(const std::string &tool, const std::string &arg, siz
         close(pfd[1]);
         if (tool == "python")      execl("/usr/bin/python3", "python3", "-c", arg.c_str(), (char *)0);
         else if (tool == "python3") execl("/usr/bin/python3", "python3", "-c", arg.c_str(), (char *)0);
-        else                       execl("/bin/sh", "sh", "-c", arg.c_str(), (char *)0);
+        else                       execl(shell_path, shell_name, "-c", arg.c_str(), (char *)0);
         _exit(127);
     }
     close(pfd[1]);
@@ -344,6 +354,8 @@ int main(int argc, char **argv) {
         "The tool then executes and its output is provided to you. Use that output to answer.\n"
         "Never wrap tools in quotes or backticks; the brackets delimit the entire request.\n"
         "If no tool is needed, just answer directly.";
+    init_shell();
+    fprintf(stderr, "shell del agente: %s (%s)\n", shell_name, shell_path);
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         const bool has = i + 1 < argc;

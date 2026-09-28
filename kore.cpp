@@ -2242,6 +2242,18 @@ struct ReactResult {
 };
 
 // Ejecuta "<tool> <arg>" capturando stdout+stderr (timeout 30s, salida capada).
+static const char *shell_path = "/bin/sh";
+static const char *shell_name = "sh";   // ruta y nombre de la shell por defecto del usuario
+static void init_shell() {
+    const char *s = getenv("SHELL");
+    if (s && s[0]) {
+        if (access(s, X_OK) == 0) {
+            shell_path = s;
+            const char *b = strrchr(s, '/');
+            shell_name = b ? b + 1 : s;
+        }
+    }
+}
 static ReactResult react_exec(const std::string &tool, const std::string &arg) {
     ReactResult r;
     const size_t max_out = 4096;
@@ -2254,7 +2266,7 @@ static ReactResult react_exec(const std::string &tool, const std::string &arg) {
         dup2(pfd[1], 1); dup2(pfd[1], 2);
         close(pfd[0]); close(pfd[1]);
         if (tool == "python" || tool == "python3") execl("/usr/bin/python3", "python3", "-c", arg.c_str(), (char *)0);
-        else                                      execl("/bin/sh", "sh", "-c", arg.c_str(), (char *)0);
+        else                                      execl(shell_path, shell_name, "-c", arg.c_str(), (char *)0);
         _exit(127);
     }
     close(pfd[1]);
@@ -2344,14 +2356,17 @@ static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &i
             std::string tool, arg; int kind = 2;
             react_split(body, tool, arg, kind);
             const std::string line = (kind == 2) ? body : tool + (arg.empty() ? "" : " " + arg);
+            const std::string disp = (kind == 1) ? line
+                                      : (kind == 0) ? std::string(shell_name) + (arg.empty() ? "" : " " + arg)
+                                                    : body;
 
             if (react_danger(kind, tool, arg, body)) {
-                s.p_tool = (kind == 2) ? "sh" : (kind == 1 ? "python" : tool);
+                s.p_tool = (kind == 1) ? "python" : std::string(shell_name);
                 s.p_arg = (kind == 2) ? body : arg;
                 s.p_waiting = true;
                 s.p_id = s.p_next++;
                 fprintf(stderr, "[react] peligro: %s\n", line.c_str());
-                sse_event(cfd, "confirm", json_escape("$ " + line + "\n(comando potencialmente peligroso; aprobacion requerida)"));
+                sse_event(cfd, "confirm", json_escape("$ " + disp + "\n(comando potencialmente peligroso; aprobacion requerida)"));
                 pend = std::string::npos;
                 return -2;
             }
@@ -2362,7 +2377,7 @@ static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &i
             const std::string out = (res.ok || !res.out.empty()) ? res.out : "(sin salida)";
             fprintf(stderr, "[react] accion tool=%s arg=%s out=%zu error?%d\n", rtool.c_str(),
                     rarg.size() > 96 ? rarg.substr(0, 96).c_str() : rarg.c_str(), out.size(), !res.ok);
-            sse_event(cfd, "tool", json_escape("$ " + line + "\n" + out));
+            sse_event(cfd, "tool", json_escape("$ " + disp + "\n" + out));
 
             std::vector<int32_t> rinj;
             chat_ids_user_only(s.v, out, rinj);
@@ -2642,6 +2657,8 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    init_shell();
+    fprintf(stderr, "shell del agente: %s (%s)\n", shell_name, shell_path);
     const char *path = nullptr;
     std::string prompt, system_msg = "You are a helpful assistant.", ids_arg, dump_path, serve_path, web_addr;
     bool have_prompt = false, raw = false, use_float = false;

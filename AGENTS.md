@@ -15,7 +15,8 @@ Motor LLM plein-c++ standalone (sin dependencias) + IPC Core/Orchestrator/TUI + 
 ## Uso rápido
 - `./kore modelo.gguf "prompt" -n 30 --temp 0` (contexto por defecto 8192, KV ≈ 896 MiB; `--ctx N` para menos; Qwen2.5 soporta 32k nativo).
 - WebUI (iteración 4/6): `./kore modelo.gguf --web 127.0.0.1:8080` → abre `http://127.0.0.1:8080`.
-  - chat con streaming SSE, un solo cliente generando a la vez; `POST /api/chat` (`temp`, `n`, `agent: true` = agente ReAct con tools `sh`/`python` in-process).
+  - `[herramienta]`/`[permiso requerido]` al agente ReAct: tools `sh`(shell por defecto del usuario, `$SHELL`) y `python` (fork+execve, timeout 30 s, salida ≤4 KiB); los comandos peligrosos piden aprobación (`/api/approve`, `[s/N]` en `kore agent`).
+  - chat con streaming SSE, un solo cliente generando a la vez; `POST /api/chat` (`temp`, `n`, `agent: true` = agente ReAct) y `POST /api/approve` (`{"allow":true|false}`).
   - al acercarse al límite de contexto, `/api/chat` condensa la conversación automáticamente (resumen generado por la propia máquina + cola de 192 tokens; evento `meta`; tarda varios minutos en esta CPU).
   - API OpenAI stateless: `GET /v1/models`, `POST /v1/chat/completions` (stream SSE estilo OpenAI + `usage`), `POST /v1/embeddings` (engine propio, dim = n_embd).
 - Servidor IPC: `./kore modelo.gguf --serve /tmp/kore.sock` (un solo cliente a la vez).
