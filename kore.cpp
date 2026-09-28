@@ -4,7 +4,7 @@
 //           ./kore modelo.gguf "texto" --raw             (sin plantilla de chat)
 //           ./kore modelo.gguf --ids 151644,872,198      (depuracion: logits del ultimo token)
 //           ./kore modelo.gguf --serve /tmp/kore.sock    (iteracion 2: servidor IPC)
-// Opciones: -n N (tokens a generar, 256)  --ctx N (contexto, 2048)  --threads N  --temp T (0 = greedy)
+// Opciones: -n N (tokens a generar, 256)  --ctx N (contexto, 8192)  --threads N  --temp T (0 = greedy)
 //           --system "..."  --seed N  --float (matvec exacto en float, lento: para depurar)  --dump f.f32
 //
 // Partes: 1-5 = cargador GGUF, descuantizacion y kernels Q4_K/Q6_K (pasos 1, 3 y 4)
@@ -1749,6 +1749,52 @@ static int gen_step(ChatSession &s, int *token, std::string *piece, bool *ctx_fu
     return 1;
 }
 
+// Condensa la conversacion cuando el contexto se acerca al limite: pide a la
+// propia maquina un resumen de la historia reciente y reconstruye la caché KV
+// con {system + resumen} + la cola de tokens recientes (el prefill desde la
+// posicion 0 sobreescribe el KV, y la atencion solo lee posiciones <= pos).
+// Devuelve el numero de tokens del resumen, o -1 si solo fallo.
+static int condense(ChatSession &s, std::string *err) {
+    const int ctx = s.e.ctx;
+    const size_t TAIL = 192, SRC = 256;                      // cola reciente y ventana a resumir
+    if ((int)s.conv.size() < (int)(TAIL + SRC + 64)) return 0;      // no hay nada que compactar
+    if ((int)s.conv.size() + 512 >= ctx) { if (err) *err = "contexto lleno sin margen para resumir"; return -1; }
+
+    const size_t cut = s.conv.size() - TAIL;
+    const std::string src_txt = decode(s.v, std::vector<int32_t>(s.conv.begin() + (long)(cut - SRC), s.conv.begin() + (long)cut));
+
+    std::vector<int32_t> ids;                                // pedir el resumen en el contexto actual
+    build_chat_message(s.v, "You are KORE. Resume en espanol y en un parrafo la conversacion que te han pasado, "
+                             "sin inventar hechos. Escribe solo el resumen, sin introduccion.",
+                        src_txt, ids, true);
+    if (!prefill(s, ids, err)) return -1;
+
+    std::string sum;
+    int nsum = 0;
+    while (nsum < 48 && (int)s.conv.size() < ctx) {
+        int tok = 0; std::string piece; bool full = false;
+        if (gen_step(s, &tok, &piece, &full) != 1) break;
+        sum += piece; nsum++;
+    }
+
+    const std::string new_sys = s.system_msg + "\n\n[Resumen de la conversacion anterior] " + sum;
+    const size_t old_size = s.conv.size();
+    std::vector<int32_t> ids2;
+    build_chat_message(s.v, new_sys, ".", ids2, true);
+    ids2.insert(ids2.end(), s.conv.end() - (long)TAIL, s.conv.end());
+    s.conv = ids2;
+    s.generating = false;
+    for (size_t i = 0; i < ids2.size(); i += (size_t)s.e.bsz) {
+        const int nb = (int)std::min<size_t>(s.e.bsz, ids2.size() - i);
+        if (!forward_batch(s.e, (const int *)(ids2.data() + i), nb, (int)i, i + (size_t)nb == ids2.size())) {
+            if (err) *err = "error rehidratando el KV tras el resumen";
+            return -1;
+        }
+    }
+    fprintf(stderr, "[condense] %zu -> %zu tokens (resumen %d)\n", old_size, ids2.size(), nsum);
+    return nsum;
+}
+
 static void serve(const char *sock_path, ChatSession &s) {
     unlink(sock_path);
     int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -2083,6 +2129,7 @@ static bool embed_text(Engine &e, const Vocab &v, const std::string &input, std:
 "if(l.startsWith('data: ')){const o=JSON.parse(l.slice(6));" \
 "if(o.type==='chunk'){out+=o.text;b.textContent=out;log.scrollTop=log.scrollHeight;}" \
 "else if(o.type==='tool'){const d=document.createElement('div');d.className='msg tool';d.textContent=o.text;b.style.display='inline-block';log.appendChild(d);log.scrollTop=log.scrollHeight;}" \
+"else if(o.type==='meta'){st.textContent=o.text+'…';}" \
 "else if(o.type==='done'){st.textContent='OK · '+o.tokens+' tokens · '+Math.round(o.ms/1000)+'s';}" \
 "else if(o.type==='error'){st.textContent='error: '+o.text;}}}}}catch(e){st.textContent='error: '+e;}" \
 "inp.disabled=snd.disabled=false;inp.focus();}" \
@@ -2396,8 +2443,16 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                     } else {
                         s.temp = (float)temp;
                         std::string err;
+                        int condensed = 0;
+                        if (!agent && (int)s.conv.size() + 600 + (int)nmax > s.e.ctx) {
+                            const int n_sum = condense(s, &err);
+                            if (n_sum < 0) { http_status(cfd, "500", "application/json",
+                                        (std::string)"{\"error\":\"no se pudo resumir el contexto: \"" + json_escape(err) + "\"}"); return; }
+                            condensed = n_sum;
+                        }
                         if (agent) {                                   // turno de agente: prefill dentro del bucle
                             http_stream_head(cfd, "200 OK", "text/event-stream");
+                            if (condensed > 0) sse_event(cfd, "meta", "contexto condensado; resumen de " + std::to_string(condensed) + " tokens");
                             const double t0 = now_ms();
                             std::vector<int32_t> ids;
                             chat_ids(s.v, KORE_AGENT_SYSTEM, prompt, ids);
@@ -2417,6 +2472,7 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                                         (std::string)"{\"error\":\"" + json_escape(err) + "\"}");
                         } else {
                             http_stream_head(cfd, "200 OK", "text/event-stream");
+                            if (condensed > 0) sse_event(cfd, "meta", "contexto condensado; resumen de " + std::to_string(condensed) + " tokens");
                             const double t0 = now_ms();
                             int n = 0;
                             for (int i = 0; i < (int)nmax; i++) {
@@ -2451,7 +2507,7 @@ static void usage(const char *prog) {
         "     %s modelo.gguf --ids 1,2,3 [--dump logits.f32]\n"
         "     %s modelo.gguf --serve /tmp/kore.sock [opciones]   (servidor IPC, iteracion 2)\n"
         "     %s modelo.gguf --web 127.0.0.1:8080 [opciones]     (WebUI, iteracion 4)\n"
-        "opciones: -n N  --ctx N  --threads N  --temp T  --seed N  --system \"...\"\n"
+        "opciones: -n N  --ctx N (por defecto 8192)  --threads N  --temp T  --seed N  --system \"...\"\n"
         "          --raw  --float  --serve SOCKET  --web IP:PUERTO\n", prog, prog, prog, prog);
 }
 
@@ -2459,7 +2515,7 @@ int main(int argc, char **argv) {
     const char *path = nullptr;
     std::string prompt, system_msg = "You are a helpful assistant.", ids_arg, dump_path, serve_path, web_addr;
     bool have_prompt = false, raw = false, use_float = false;
-    int n_predict = 256, ctx = 2048;
+    int n_predict = 256, ctx = 8192;
     unsigned nth = std::max(1u, std::thread::hardware_concurrency());
     float temp = 0.0f;
     uint32_t seed = (uint32_t)std::chrono::system_clock::now().time_since_epoch().count();
