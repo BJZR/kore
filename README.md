@@ -225,6 +225,16 @@ curl -s -N -X POST http://127.0.0.1:8085/api/chat \
 
 La validación numérica del matmul por lotes se hace comparando contra una referencia en `double` (get_row + dot).
 
+## Backup a GitHub (`./kore_backup.sh`)
+
+Guarda todo el proyecto en tu cuenta (repo `kore`, rama `main`), ignorando binarios, `bin/`, `run/`, `*.gguf`, logs y tokens:
+
+```bash
+./kore_backup.sh
+```
+
+Solo te pide la **API key de GitHub** la primera vez (se guarda en `~/.config/kore-github-token`, fuera del repo; también se acepta `KORE_GITHUB_TOKEN=...`). El script valida que el token pertenezca a tu cuenta, crea el repo remoto si no existe, commitea los cambios y hace `push`.
+
 ---
 
 ## Notas y límites
