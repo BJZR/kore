@@ -15,4 +15,6 @@ kore_tui
 *.log
 *.sock
 /tmp/
-.ctxt
+.ctxt*.token
+*.openai_key
+texto.txt
