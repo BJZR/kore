@@ -209,6 +209,73 @@ static void emit_status(int ui, const std::string &s) {
     send_frame(ui, 'S', s.data(), (uint32_t)s.size());
 }
 
+// Divide el cuerpo de una accion. kind: 0=shell <arg> 1=python3 <arg> 2=linea de shell completa.
+// Normaliza la forma libre ("touch x", "echo hola") y la envuelta ("sh -c \"...\"", "python -c \"...\"").
+static std::string unquote(std::string s) {
+    s = trim(s);
+    if (s.size() >= 2) {
+        const char q = s.front();
+        if ((q == '"' || q == '\'') && s.back() == q) {
+            if (q == '"' && s.find('"', 1) != s.size() - 1) return s;
+            return s.substr(1, s.size() - 2);
+        }
+    }
+    return s;
+}
+static void split_action(const std::string &body, std::string &tool, std::string &arg, int &kind) {
+    const size_t sp = body.find_first_of(" \t\r\n");
+    std::string t0 = body, rest;
+    if (sp != std::string::npos) { t0 = body.substr(0, sp); rest = trim(body.substr(sp + 1)); }
+    t0 = trim(t0);
+    kind = 2;
+    const bool ispy = (t0 == "python" || t0 == "python3");
+    const bool issh = (t0 == "sh" || t0 == "bash");
+    if (!ispy && !issh) { tool = t0; arg = rest; return; }      // forma libre
+
+    if (rest.rfind("-c", 0) == 0 && rest.size() > 2) rest = trim(rest.substr(2));
+    if (!rest.empty() && (rest.front() == '"' || rest.front() == '\'')) {
+        const char q = rest.front();
+        const size_t c = rest.find(q, 1);
+        if (c != std::string::npos && c + 1 < rest.size()) {    // shell tras las comillas
+            tool = t0; arg = rest; kind = 2;                    // -> linea de shell completa
+            return;
+        }
+    }
+    if (ispy && !rest.empty() && rest.front() == '-') {         // flags CLI (python -m ...), no codigo
+        tool = t0; arg = rest; kind = 2;
+        return;
+    }
+    if (ispy) { kind = 1; tool = "python"; arg = unquote(rest); return; }
+    kind = 0; tool = "sh"; arg = unquote(rest);
+}
+
+// "python" sin version no existe en muchos sistemas; mapeala al python3 instalado.
+static std::string shell_line(const std::string &body) {
+    if (body.rfind("python ", 0) == 0 || body.rfind("python\t", 0) == 0)
+        return "python3 " + body.substr(6);
+    return body;
+}
+
+// Heuristica de comandos destructivos: se bloquean por defecto en el modo TUI/orch.
+static bool danger_action(int kind, const std::string &tool, const std::string &arg, const std::string &body) {
+    const std::string line = (kind == 2) ? body : tool + (arg.empty() ? "" : " " + arg);
+    auto has = [&](const char *p) { return line.find(p) != std::string::npos; };
+    if (has("rm -rf") || has("rm -fr") || has("rm -r /") || has("rm -R /")) return true;
+    static const char *pats[] = {
+        "mkfs", "fdisk", "dd if=", "of=/dev/sd", "of=/dev/mmcblk", "> /dev/sd", "/dev/sda", "/dev/sdb",
+        "sudo ", "shutdown", "reboot", "poweroff", "halt", ":(){", "kill -9", "kill -s 9", "pkill",
+        "userdel", "deluser", "passwd ", "chmod -R 777 /", "chown -R /", "cryptsetup", "mkswap",
+        "chattr -", "> /etc/", ">> /etc/", "mv /", "cp -r /", "rsync -r /",
+    };
+    for (size_t i = 0; i < sizeof(pats) / sizeof(pats[0]); i++) if (has(pats[i])) return true;
+    if (kind == 1) {
+        static const char *pp[] = { "os.remove(", "os.unlink(", "shutil.rmtree(", "os.system(",
+                                    "os.popen(", "subprocess", "eval(", "exec(", "os.exec(" };
+        for (size_t i = 0; i < sizeof(pp) / sizeof(pp[0]); i++) if (line.find(pp[i]) != std::string::npos) return true;
+    }
+    return false;
+}
+
 // Detecta "[ACTION: <tool> <arg>]" en t.buf. Devuelve true si proceso una accion.
 static bool scan_action(Turn &t, int ui, int core) {
     const size_t limit = t.buf.size();
@@ -235,23 +302,29 @@ static bool scan_action(Turn &t, int ui, int core) {
         t.pend = std::string::npos;
         if (body.empty()) { t.buf.erase(0, e + 1); t.emit_upto = 0; continue; }
 
-        const size_t sp = body.find(' ');
-        std::string tool = body, arg;
-        if (sp != std::string::npos) { tool = body.substr(0, sp); arg = trim(body.substr(sp + 1)); }
-        tool = trim(tool);
+        std::string tool, arg;
+        int kind = 2;
+        split_action(body, tool, arg, kind);
+        const size_t w0 = body.find_first_of(" \t\r\n");
+        const std::string first = w0 == std::string::npos ? body : body.substr(0, w0);
 
         if (s > t.emit_upto) {                     // texto antes de la accion
             const std::string pre = t.buf.substr(t.emit_upto, s - t.emit_upto);
             send_frame(ui, 'A', pre.data(), (uint32_t)pre.size());
         }
-        const std::string show = "# " + tool + (arg.empty() ? "" : " " + arg);
-        send_frame(ui, 'T', show.data(), (uint32_t)show.size());
-        emit_status(ui, "agente: ejecutando " + tool + "...");
+        const std::string tline = "# " + body;     // muestra la linea que escribio el modelo
+        send_frame(ui, 'T', tline.data(), (uint32_t)tline.size());
+        emit_status(ui, "agente: ejecutando " + first + "...");
 
-        const ToolResult res = exec_tool(tool, arg, 3000);
-        const std::string out = res.ok || !res.out.empty()
-            ? (res.timed_out ? res.out : res.out)
-            : "(sin salida)";
+        std::string out;
+        if (danger_action(kind, tool, arg, body)) {
+            out = "comando potencialmente peligroso: BLOQUEADO (no se ejecuto; aprobar via WebUI/kore.sh)";
+        } else {
+            std::string rtool = tool, rarg = arg;
+            if (kind == 2) { rtool = "sh"; rarg = shell_line(body); }
+            const ToolResult res = exec_tool(rtool, rarg, 3000);
+            out = res.out.empty() ? "(sin salida)" : res.out;
+        }
         send_frame(ui, 'O', out.data(), (uint32_t)out.size());
 
         if (core >= 0) {                           // reinyecta el resultado y sigue

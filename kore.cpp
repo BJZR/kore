@@ -2178,27 +2178,43 @@ static std::string react_unquote(std::string s) {
 }
 
 // Divide el cuerpo de una accion. kind: 0=sh -c <arg> 1=python3 -c <arg> 2=linea de shell completa.
-// El modelo a veces emite la forma libre ("touch texto.txt", "echo hola") o la forma
-// envuelta ("sh -c \"ls -la\"" / "python -c \"print(1)\""): ambas se normalizan.
+// El modelo a veces emite la forma libre ("touch texto.txt", "echo hola"), la forma
+// envuelta ("sh -c \"ls -la\"" / "python -c \"print(1)\"") o código con sintaxis de
+// shell pegada al final ("python -c '...' > /dev/null 2>&1 &"): si tras la comilla de
+// cierre queda texto, la accion completa se ejecuta como LINEA DE SHELL.
 static void react_split(const std::string &body, std::string &tool, std::string &arg, int &kind) {
     size_t sp = body.find_first_of(" \t\r\n");
     std::string t0 = body, rest;
     if (sp != std::string::npos) { t0 = body.substr(0, sp); rest = react_trim(body.substr(sp + 1)); }
     t0 = react_trim(t0);
     kind = 2;
-    if (t0 == "python" || t0 == "python3") {
-        kind = 1;
-        if (rest.rfind("-c", 0) == 0) rest = react_trim(rest.substr(2));
-        tool = "python"; arg = react_unquote(rest);
+    const bool ispy = (t0 == "python" || t0 == "python3");
+    const bool issh = (t0 == "sh" || t0 == "bash");
+    if (!ispy && !issh) { tool = t0; arg = rest; return; }      // forma libre
+
+    if (rest.rfind("-c", 0) == 0) rest = react_trim(rest.substr(2));
+    if (!rest.empty() && (rest.front() == '"' || rest.front() == '\'')) {
+        const char q = rest.front();
+        const size_t c = rest.find(q, 1);
+        if (c != std::string::npos && c + 1 < rest.size()) {    // shell tras las comillas
+            tool = t0; arg = rest; kind = 2;                    // -> linea de shell completa
+            return;
+        }
+    }
+    if (ispy && !rest.empty() && rest.front() == '-') {         // flags CLI (python -m ...), no codigo
+        tool = t0; arg = rest; kind = 2;
         return;
     }
-    if (t0 == "sh" || t0 == "bash") {
-        kind = 0;
-        if (rest.rfind("-c", 0) == 0) rest = react_trim(rest.substr(2));
-        tool = "sh"; arg = react_unquote(rest);
-        return;
-    }
-    tool = t0; arg = rest;           // forma libre: la ejecutable completa es la propia body
+    if (ispy) { kind = 1; tool = "python"; arg = react_unquote(rest); return; }
+    kind = 0; tool = "sh"; arg = react_unquote(rest);
+}
+
+// Normaliza una linea de shell para ejecutarla: "python" sin version no existe en
+// muchos sistemas; se mapea al python3 instalado.
+static std::string react_shell_line(const std::string &body) {
+    if (body.rfind("python ", 0) == 0 || body.rfind("python\t", 0) == 0)
+        return "python3 " + body.substr(6);
+    return body;
 }
 
 // Heuristica de comandos destructivos: se exige aprobacion antes de ejecutarlos.
@@ -2372,7 +2388,7 @@ static int web_react_turn(int cfd, ChatSession &s, const std::vector<int32_t> &i
             }
 
             std::string rtool = tool, rarg = arg;
-            if (kind == 2) rtool = "sh", rarg = body;
+            if (kind == 2) { rtool = "sh"; rarg = react_shell_line(body); }
             const ReactResult res = react_exec(rtool, rarg);
             const std::string out = (res.ok || !res.out.empty()) ? res.out : "(sin salida)";
             fprintf(stderr, "[react] accion tool=%s arg=%s out=%zu error?%d\n", rtool.c_str(),
@@ -2540,7 +2556,8 @@ static void web_server(const char *addr_port, ChatSession &s, const Model &model
                     s.p_tool.clear(); s.p_arg.clear();
                     std::string inject;
                     if (allow) {
-                        const ReactResult res = react_exec(ptool, parg);
+                        const std::string rarg = (ptool == "python") ? parg : react_shell_line(parg);
+                        const ReactResult res = react_exec(ptool, rarg);
                         inject = (res.ok || !res.out.empty()) ? res.out : "(sin salida)";
                         fprintf(stderr, "[react] aprobado tool=%s arg=%s\n", ptool.c_str(),
                                 parg.size() > 96 ? parg.substr(0, 96).c_str() : parg.c_str());
